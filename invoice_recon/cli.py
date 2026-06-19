@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export, rules, snapshot, pack
+from . import db, validators, matcher, export, rules, snapshot, pack, plan
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -32,33 +32,34 @@ def init():
               help=rules.IMPORT_PAYMENTS_HELP)
 @click.option("--name", default=None,
               help="批次名称（默认自动生成）")
-def import_data(invoices, payments, name):
-    try:
-        inv_result = validators.parse_invoices(invoices)
-    except validators.ValidationError as e:
-        click.echo(f"发票文件格式错误:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
-        raise SystemExit(1)
+@click.option("--dry-run", "--plan", "dry_run", is_flag=True, default=False,
+              help=rules.PLAN_DRY_RUN_OPTION_HELP)
+def import_data(invoices, payments, name, dry_run):
+    if dry_run:
+        _run_import_dry_run(invoices, payments, name)
+        return
 
-    try:
-        pay_result = validators.parse_payments(payments)
-    except validators.ValidationError as e:
-        click.echo(f"付款文件格式错误:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
-        raise SystemExit(1)
-
-    if not inv_result.has_items and not pay_result.has_items:
-        click.echo("错误: 发票和付款文件均无合法数据", err=True)
+    # 真实导入：复用同一套校验逻辑（先跑一遍 plan，确保校验一致）
+    plan_result = plan.plan_import(invoices, payments, name)
+    if not plan_result.success:
+        click.echo(f"{rules.PLAN_SECTION_ERRORS}:", err=True)
+        for e in plan_result.errors:
+            click.echo(f"  ✗ {e}", err=True)
         raise SystemExit(1)
 
     rule = db.get_current_rule()
-    if name is None:
-        name = f"batch_{rule.version}"
+    final_name = plan_result.batch_name
+
+    # 重新解析 CSV（与 plan 复用同一套 validators）
+    inv_result = validators.parse_invoices(invoices)
+    pay_result = validators.parse_payments(payments)
 
     conn = db.connect()
     try:
         with conn:
             cur = conn.execute(
                 "INSERT INTO batches (name, rule_version) VALUES (?, ?)",
-                (name, rule.version),
+                (final_name, rule.version),
             )
             batch_id = cur.lastrowid
 
@@ -77,7 +78,7 @@ def import_data(invoices, payments, name):
     finally:
         conn.close()
 
-    click.echo(f"批次 {batch_id} 已创建: {name}")
+    click.echo(f"{rules.PLAN_REAL_MODE_LABEL} 批次 {batch_id} 已创建: {final_name}")
     click.echo(f"  发票: {len(inv_result.items)} 条 | 付款: {len(pay_result.items)} 条 | 规则: {rule.version}")
     click.echo(rules.IMPORT_OK_HINT_LEGACY_ROW)
     if inv_result.errors:
@@ -88,6 +89,46 @@ def import_data(invoices, payments, name):
         click.echo(f"{rules.IMPORT_OK_HINT_BAD_ROWS_PREFIX} 付款 {len(pay_result.errors)} 行 {rules.IMPORT_OK_HINT_BAD_ROWS_SUFFIX}:")
         for e in pay_result.errors:
             click.echo(f"    - {e}")
+
+
+def _run_import_dry_run(invoices: str, payments: str, name: str):
+    """执行 import 的 dry-run 预检，输出计划结果。"""
+    result = plan.plan_import(invoices, payments, name)
+
+    if not result.success:
+        click.echo(f"{rules.PLAN_MODE_PREFIX}预检失败", err=True)
+        click.echo(f"{rules.PLAN_SECTION_ERRORS}:", err=True)
+        for e in result.errors:
+            click.echo(f"  ✗ {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.PLAN_MODE_PREFIX}导入计划 {rules.PLAN_MODE_LABEL}")
+    click.echo()
+
+    click.echo(rules.PLAN_SECTION_BATCH)
+    click.echo(f"  批次名称: {result.batch_name}")
+    if result.was_renamed:
+        click.echo(f"  原名称: {result.original_name}（将自动重命名）")
+    click.echo(f"  规则版本: {result.rule_version}")
+    click.echo(f"  初始状态: {result.batch_status}")
+    click.echo()
+
+    click.echo(rules.PLAN_SECTION_RECORDS)
+    click.echo(f"  发票: {result.invoice_count} 条合法")
+    if result.bad_invoice_count:
+        click.echo(f"         ({result.bad_invoice_count} 行坏数据将被跳过)")
+    click.echo(f"  付款: {result.payment_count} 条合法")
+    if result.bad_payment_count:
+        click.echo(f"         ({result.bad_payment_count} 行坏数据将被跳过)")
+    click.echo()
+
+    if result.warnings:
+        click.echo(f"{rules.PLAN_SECTION_WARNINGS}:")
+        for w in result.warnings:
+            click.echo(f"  ⚠  {w}")
+        click.echo()
+
+    click.echo(rules.PLAN_HINT_REAL_IMPORT)
 
 
 @cli.command()
@@ -755,10 +796,24 @@ def pack_cmd(batch, output, name, include_export, force):
 @click.option("--batch-name", default=None, help="新批次名称（默认使用包内批次名）")
 @click.option("--force", is_flag=True, default=False,
               help="同名快照文件已存在时强制覆盖")
-def unpack_cmd(input_file, batch_name, force):
+@click.option("--dry-run", "--plan", "dry_run", is_flag=True, default=False,
+              help=rules.PLAN_DRY_RUN_OPTION_HELP)
+def unpack_cmd(input_file, batch_name, force, dry_run):
+    if dry_run:
+        _run_unpack_dry_run(input_file, batch_name, force)
+        return
+
     if not os.path.exists(input_file):
         click.echo(f"错误: 包文件不存在: {input_file}", err=True)
         raise SystemExit(1)
+
+    # 真实导入：复用同一套校验逻辑（先跑一遍 plan，确保校验一致）
+    plan_result = plan.plan_unpack(input_file, batch_name, force)
+    if not plan_result.success:
+        error_msg = ";\n".join(plan_result.errors)
+        click.echo(f"错误: 包校验失败: {error_msg}", err=True)
+        raise SystemExit(1)
+
     try:
         result = pack.unpack_package(
             package_path=input_file,
@@ -773,7 +828,7 @@ def unpack_cmd(input_file, batch_name, force):
         click.echo(f"错误: {e}", err=True)
         raise SystemExit(1)
 
-    click.echo(rules.PACK_OK_UNPACKED)
+    click.echo(f"{rules.PLAN_REAL_MODE_LABEL} {rules.PACK_OK_UNPACKED}")
     click.echo(f"  新批次 ID: {result['new_batch_id']}")
     click.echo(f"  新批次名称: {result['new_batch_name']}")
     if result["was_renamed"]:
@@ -806,11 +861,55 @@ def unpack_cmd(input_file, batch_name, force):
         if len(vr["pending"]) > 5:
             click.echo(f"    ... 还有 {len(vr['pending']) - 5} 条")
 
-    if result["warnings"]:
+
+def _run_unpack_dry_run(input_file: str, batch_name: str, force: bool):
+    """执行 unpack 的 dry-run 预检，输出计划结果。"""
+    result = plan.plan_unpack(input_file, batch_name, force)
+
+    if not result.success:
+        click.echo(f"{rules.PLAN_MODE_PREFIX}预检失败", err=True)
+        click.echo(f"{rules.PLAN_SECTION_ERRORS}:", err=True)
+        for e in result.errors:
+            click.echo(f"  ✗ {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.PLAN_MODE_PREFIX}包导入计划 {rules.PLAN_MODE_LABEL}")
+    click.echo()
+
+    click.echo(rules.PLAN_SECTION_BATCH)
+    click.echo(f"  批次名称: {result.batch_name}")
+    if result.was_renamed:
+        click.echo(f"  原名称: {result.original_name}（将自动重命名）")
+    click.echo(f"  规则版本: {result.rule_version}")
+    click.echo(f"  批次状态: {result.batch_status}")
+    click.echo()
+
+    click.echo(rules.PLAN_SECTION_RECORDS)
+    click.echo(f"  发票: {result.invoice_count} 条")
+    click.echo(f"  付款: {result.payment_count} 条")
+    click.echo(f"  匹配: {result.match_count} 条")
+    if result.conflict_match_count:
+        click.echo(f"    其中冲突: {result.conflict_match_count} 条")
+    click.echo(f"  裁决历史: {result.adjudication_count} 条")
+    click.echo(f"  沿用原状态: {result.preserved_count} 条（已裁决，状态不变）")
+    pending_count = result.match_count - result.preserved_count
+    click.echo(f"  待复核/重分配: {pending_count} 条")
+    click.echo()
+
+    click.echo(rules.PLAN_SECTION_FILES)
+    if result.snapshot_file:
+        click.echo(f"  快照文件: {result.snapshot_file}")
+    if result.export_file:
+        click.echo(f"  导出结果: {result.export_file}")
+    click.echo()
+
+    if result.warnings:
+        click.echo(f"{rules.PLAN_SECTION_WARNINGS}:")
+        for w in result.warnings:
+            click.echo(f"  ⚠  {w}")
         click.echo()
-        click.echo("⚠  警告:")
-        for w in result["warnings"]:
-            click.echo(f"  - {w}")
+
+    click.echo(rules.PLAN_HINT_REAL_IMPORT)
 
 
 @cli.command("verify", help=rules.PACK_VERIFY_HELP)
