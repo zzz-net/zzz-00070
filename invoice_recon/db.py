@@ -373,6 +373,53 @@ def get_latest_adjudication(match_id: int,
         conn.close()
 
 
+def get_auto_rejected_siblings(match_id: int,
+                               db_path: Optional[str] = None) -> List[dict]:
+    conn = connect(db_path)
+    try:
+        m = conn.execute(
+            "SELECT invoice_id, payment_id, batch_id FROM matches WHERE id = ?",
+            (match_id,),
+        ).fetchone()
+        if m is None:
+            return []
+        conditions = []
+        params: list = []
+        if m["invoice_id"] is not None:
+            conditions.append("invoice_id = ?")
+            params.append(m["invoice_id"])
+        if m["payment_id"] is not None:
+            conditions.append("payment_id = ?")
+            params.append(m["payment_id"])
+        if not conditions:
+            return []
+        params.append(match_id)
+        rows = conn.execute(
+            f"SELECT * FROM matches "
+            f"WHERE ({' OR '.join(conditions)}) AND id != ? "
+            f"AND adjudication = 'auto_rejected' AND status = 'rejected'",
+            params,
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_latest_adjudication_before(match_id: int, before_action: str,
+                                   db_path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM adjudications "
+            "WHERE match_id = ? AND action = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (match_id, before_action),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
 def get_adjudication_by_id(adj_id: int,
                            db_path: Optional[str] = None) -> Optional[dict]:
     conn = connect(db_path)

@@ -87,12 +87,13 @@ def import_data(invoices, payments, name):
 
     click.echo(f"批次 {batch_id} 已创建: {name}")
     click.echo(f"  发票: {len(inv_result.items)} 条 | 付款: {len(pay_result.items)} 条 | 规则: {rule.version}")
+    click.echo(f"  旧批次状态未受影响")
     if inv_result.errors:
-        click.echo(f"  ⚠ 发票跳过 {len(inv_result.errors)} 行:")
+        click.echo(f"  ⚠ 发票跳过 {len(inv_result.errors)} 行（合法数据已正常入库）:")
         for e in inv_result.errors:
             click.echo(f"    - {e}")
     if pay_result.errors:
-        click.echo(f"  ⚠ 付款跳过 {len(pay_result.errors)} 行:")
+        click.echo(f"  ⚠ 付款跳过 {len(pay_result.errors)} 行（合法数据已正常入库）:")
         for e in pay_result.errors:
             click.echo(f"    - {e}")
 
@@ -238,6 +239,8 @@ def review_undo(batch, match_id):
 
     仅能撤销上一次人工裁决（confirm 或 reject）。
     撤销后该条匹配回到 pending/conflict 状态。
+    如该条是对冲突记录的 confirm，相关联被 auto_rejected 的冲突记录
+    也会一并恢复到 conflict 状态，以便用户重新选择。
     """
     b = db.get_batch(batch)
     if b is None:
@@ -268,6 +271,13 @@ def review_undo(batch, match_id):
     prev_note = latest["prev_note"]
     prev_adj = None if prev_status in (MatchStatus.PENDING, MatchStatus.CONFLICT) else m.get("adjudication")
 
+    was_confirmed_undo = (
+        m.get("adjudication") == "confirmed"
+        and prev_status == MatchStatus.CONFLICT
+    )
+
+    siblings_restored: list = []
+
     conn = db.connect()
     try:
         with conn:
@@ -286,6 +296,44 @@ def review_undo(batch, match_id):
                 (match_id, batch, f"撤销上一次裁决",
                  curr_row["status"], curr_row["review_note"]),
             )
+
+            if was_confirmed_undo:
+                siblings = conn.execute(
+                    "SELECT id, invoice_id, payment_id FROM matches "
+                    "WHERE adjudication = 'auto_rejected' AND status = 'rejected' "
+                    "AND id != ? AND batch_id = ? "
+                    "AND (invoice_id = ? OR payment_id = ?)",
+                    (match_id, batch, m.get("invoice_id"), m.get("payment_id")),
+                ).fetchall()
+                for sib in siblings:
+                    sib_adj = conn.execute(
+                        "SELECT prev_status, prev_note FROM adjudications "
+                        "WHERE match_id = ? AND action = 'auto_rejected' "
+                        "ORDER BY id DESC LIMIT 1",
+                        (sib["id"],),
+                    ).fetchone()
+                    if sib_adj is None:
+                        sib_prev_status = MatchStatus.CONFLICT
+                        sib_prev_note = None
+                    else:
+                        sib_prev_status = sib_adj["prev_status"] or MatchStatus.CONFLICT
+                        sib_prev_note = sib_adj["prev_note"]
+                    sib_curr = conn.execute(
+                        "SELECT status, review_note FROM matches WHERE id = ?",
+                        (sib["id"],),
+                    ).fetchone()
+                    conn.execute(
+                        "UPDATE matches SET status = ?, adjudication = NULL, review_note = ? "
+                        "WHERE id = ?",
+                        (sib_prev_status, sib_prev_note, sib["id"]),
+                    )
+                    conn.execute(
+                        "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                        "VALUES (?, ?, 'undone_auto_rejected', ?, ?, ?)",
+                        (sib["id"], batch, "因关联裁决撤销，恢复冲突可复核状态",
+                         sib_curr["status"], sib_curr["review_note"]),
+                    )
+                    siblings_restored.append(sib["id"])
 
             if b.status in (BatchStatus.REVIEWED, BatchStatus.EXPORTED):
                 pending = conn.execute(
@@ -308,6 +356,8 @@ def review_undo(batch, match_id):
         click.echo(f"  备注已恢复: {prev_note}")
     else:
         click.echo(f"  备注已清空")
+    if siblings_restored:
+        click.echo(f"  关联冲突记录已恢复可复核: #{', #'.join(str(s) for s in siblings_restored)}")
 
 
 def _review_single(batch_id, match_id, action, note):
@@ -471,20 +521,23 @@ def revoke(batch):
 @click.option("--output", required=True, type=click.Path(),
               help="导出文件路径 (CSV)")
 def export_cmd(batch, output):
-    """导出差异清单 (CSV)
+    """导出待处理清单 (CSV)
 
-    仅导出需要处理的差异记录，零差额且已确认的正常匹配不会导出。
-    导出记录包含: 冲突、未解决、已拒绝、以及有差额的已确认匹配。
+    仅导出还需要处理的记录:
+    - pending / conflict: 待人工复核的未解决记录
+    - 有差额的 confirmed: 已确认但金额有差异，需要后续跟进
 
-    批次状态须为 reviewed 或 exported。导出为原子写入，不会产生半截文件。
+    已拒绝 (rejected) 和零差额已确认的记录不导出。
+    批次状态须为 matched / reviewed / exported（含撤销后回到 matched 的情况）。
+    导出为原子写入，不会产生半截文件。
     导出后批次状态变为 exported（可重复导出覆盖）。
     """
     b = db.get_batch(batch)
     if b is None:
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
         raise SystemExit(1)
-    if b.status not in (BatchStatus.REVIEWED, BatchStatus.EXPORTED):
-        click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 reviewed/exported 状态可导出", err=True)
+    if b.status not in (BatchStatus.MATCHED, BatchStatus.REVIEWED, BatchStatus.EXPORTED):
+        click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 matched/reviewed/exported 状态可导出", err=True)
         raise SystemExit(1)
 
     all_matches = db.get_matches_by_batch(batch)
@@ -494,10 +547,13 @@ def export_cmd(batch, output):
 
     diff_matches = [
         m for m in all_matches
-        if not (m["status"] == MatchStatus.CONFIRMED and abs(m["amount_diff"]) < 0.001)
+        if (
+            m["status"] in (MatchStatus.PENDING, MatchStatus.CONFLICT)
+            or (m["status"] == MatchStatus.CONFIRMED and abs(m["amount_diff"]) >= 0.001)
+        )
     ]
     if not diff_matches:
-        click.echo(f"批次 {batch} 无差异记录（全部为零差额已确认匹配）")
+        click.echo(f"批次 {batch} 无待处理记录（全部为零差额已确认或已拒绝）")
         raise SystemExit(1)
 
     try:
@@ -507,8 +563,12 @@ def export_cmd(batch, output):
         raise SystemExit(1)
 
     db.update_batch_status(batch, BatchStatus.EXPORTED)
-    click.echo(f"差异清单已导出: {out_path}")
-    click.echo(f"  差异记录: {len(diff_matches)} 条（共 {len(all_matches)} 条匹配中过滤掉 {len(all_matches) - len(diff_matches)} 条零差额已确认记录")
+    click.echo(f"待处理清单已导出: {out_path}")
+    click.echo(
+        f"  待处理记录: {len(diff_matches)} 条"
+        f"（共 {len(all_matches)} 条匹配中过滤掉 "
+        f"{len(all_matches) - len(diff_matches)} 条已拒绝或零差额已确认记录）"
+    )
 
 
 @cli.command("list")
