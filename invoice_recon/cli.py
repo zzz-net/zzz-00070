@@ -39,18 +39,22 @@ def import_data(invoices, payments, name):
     付款 CSV 格式: payment_no,vendor,amount,date
 
     金额必须为数字，发票号/付款编号在批次内不可重复。
-    校验失败时不写入任何数据。
+    存在非法行时跳过并保留合法数据，缺少列或文件为空时整体失败。
     """
     try:
-        inv_list = validators.parse_invoices(invoices)
+        inv_result = validators.parse_invoices(invoices)
     except validators.ValidationError as e:
-        click.echo(f"发票文件校验失败:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
+        click.echo(f"发票文件格式错误:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
         raise SystemExit(1)
 
     try:
-        pay_list = validators.parse_payments(payments)
+        pay_result = validators.parse_payments(payments)
     except validators.ValidationError as e:
-        click.echo(f"付款文件校验失败:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
+        click.echo(f"付款文件格式错误:\n" + "\n".join(f"  - {x}" for x in e.errors), err=True)
+        raise SystemExit(1)
+
+    if not inv_result.has_items and not pay_result.has_items:
+        click.echo("错误: 发票和付款文件均无合法数据", err=True)
         raise SystemExit(1)
 
     rule = db.get_current_rule()
@@ -66,23 +70,31 @@ def import_data(invoices, payments, name):
             )
             batch_id = cur.lastrowid
 
-            conn.executemany(
-                "INSERT INTO invoices (batch_id, invoice_no, vendor, amount, date) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(batch_id, i.invoice_no, i.vendor, i.amount, i.date) for i in inv_list],
-            )
-            conn.executemany(
-                "INSERT INTO payments (batch_id, payment_no, vendor, amount, date) "
-                "VALUES (?, ?, ?, ?, ?)",
-                [(batch_id, p.payment_no, p.vendor, p.amount, p.date) for p in pay_list],
-            )
-    except Exception:
-        raise SystemExit(1)
+            if inv_result.items:
+                conn.executemany(
+                    "INSERT INTO invoices (batch_id, invoice_no, vendor, amount, date) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(batch_id, i.invoice_no, i.vendor, i.amount, i.date) for i in inv_result.items],
+                )
+            if pay_result.items:
+                conn.executemany(
+                    "INSERT INTO payments (batch_id, payment_no, vendor, amount, date) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    [(batch_id, p.payment_no, p.vendor, p.amount, p.date) for p in pay_result.items],
+                )
     finally:
         conn.close()
 
     click.echo(f"批次 {batch_id} 已创建: {name}")
-    click.echo(f"  发票: {len(inv_list)} 条 | 付款: {len(pay_list)} 条 | 规则: {rule.version}")
+    click.echo(f"  发票: {len(inv_result.items)} 条 | 付款: {len(pay_result.items)} 条 | 规则: {rule.version}")
+    if inv_result.errors:
+        click.echo(f"  ⚠ 发票跳过 {len(inv_result.errors)} 行:")
+        for e in inv_result.errors:
+            click.echo(f"    - {e}")
+    if pay_result.errors:
+        click.echo(f"  ⚠ 付款跳过 {len(pay_result.errors)} 行:")
+        for e in pay_result.errors:
+            click.echo(f"    - {e}")
 
 
 @cli.command()
@@ -218,6 +230,86 @@ def review(batch, match_id, action, note):
         click.echo(f"批次 {batch} 仍有 {pending} 条待复核")
 
 
+@cli.command("review-undo")
+@click.option("--batch", required=True, type=int, help="批次 ID")
+@click.option("--match-id", required=True, type=int, help="匹配记录 ID")
+def review_undo(batch, match_id):
+    """撤销单条匹配的上一次裁决，恢复复核前的状态和备注
+
+    仅能撤销上一次人工裁决（confirm 或 reject）。
+    撤销后该条匹配回到 pending/conflict 状态。
+    """
+    b = db.get_batch(batch)
+    if b is None:
+        click.echo(f"错误: 批次 {batch} 不存在", err=True)
+        raise SystemExit(1)
+    if b.status not in (BatchStatus.MATCHED, BatchStatus.REVIEWED, BatchStatus.EXPORTED):
+        click.echo(f"错误: 批次 {batch} 状态为 {b.status}，不可撤销裁决", err=True)
+        raise SystemExit(1)
+
+    m = db.get_match(match_id)
+    if m is None:
+        click.echo(f"错误: 匹配记录 {match_id} 不存在", err=True)
+        raise SystemExit(1)
+    if m["batch_id"] != batch:
+        click.echo(f"错误: 匹配记录 {match_id} 不属于批次 {batch}", err=True)
+        raise SystemExit(1)
+
+    if m["status"] in (MatchStatus.PENDING, MatchStatus.CONFLICT):
+        click.echo(f"匹配 #{match_id} 当前状态为 {m['status']}，无需撤销")
+        return
+
+    latest = db.get_latest_adjudication(match_id)
+    if latest is None or latest.get("prev_status") is None:
+        click.echo(f"错误: 匹配 #{match_id} 无可撤销的裁决记录", err=True)
+        raise SystemExit(1)
+
+    prev_status = latest["prev_status"]
+    prev_note = latest["prev_note"]
+    prev_adj = None if prev_status in (MatchStatus.PENDING, MatchStatus.CONFLICT) else m.get("adjudication")
+
+    conn = db.connect()
+    try:
+        with conn:
+            curr_row = conn.execute(
+                "SELECT status, review_note, adjudication FROM matches WHERE id = ?",
+                (match_id,),
+            ).fetchone()
+
+            conn.execute(
+                "UPDATE matches SET status = ?, adjudication = ?, review_note = ? WHERE id = ?",
+                (prev_status, prev_adj, prev_note, match_id),
+            )
+            conn.execute(
+                "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                "VALUES (?, ?, 'undone', ?, ?, ?)",
+                (match_id, batch, f"撤销上一次裁决",
+                 curr_row["status"], curr_row["review_note"]),
+            )
+
+            if b.status in (BatchStatus.REVIEWED, BatchStatus.EXPORTED):
+                pending = conn.execute(
+                    "SELECT COUNT(*) AS cnt FROM matches "
+                    "WHERE batch_id = ? AND status IN ('pending','conflict')",
+                    (batch,),
+                ).fetchone()["cnt"]
+                if pending > 0:
+                    conn.execute(
+                        "UPDATE batches SET status = 'matched', updated_at = datetime('now') "
+                        "WHERE id = ?",
+                        (batch,),
+                    )
+    finally:
+        conn.close()
+
+    click.echo(f"匹配 #{match_id} 已撤销裁决")
+    click.echo(f"  状态: {m['status']} → {prev_status}")
+    if prev_note:
+        click.echo(f"  备注已恢复: {prev_note}")
+    else:
+        click.echo(f"  备注已清空")
+
+
 def _review_single(batch_id, match_id, action, note):
     if action is None:
         click.echo("错误: 非交互模式必须指定 --action (confirm/reject)", err=True)
@@ -270,6 +362,9 @@ def _apply_review(batch_id, match_id, m, action, note):
     adjudication = "confirmed" if action == "confirm" else "rejected"
     new_status = MatchStatus.CONFIRMED if action == "confirm" else MatchStatus.REJECTED
 
+    prev_status = m.get("status")
+    prev_note = m.get("review_note")
+
     conn = db.connect()
     try:
         with conn:
@@ -278,18 +373,41 @@ def _apply_review(batch_id, match_id, m, action, note):
                 (new_status, adjudication, note, match_id),
             )
             conn.execute(
-                "INSERT INTO adjudications (match_id, batch_id, action, note) VALUES (?, ?, ?, ?)",
-                (match_id, batch_id, adjudication, note),
+                "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (match_id, batch_id, adjudication, note, prev_status, prev_note),
             )
 
             if action == "confirm":
                 if m.get("invoice_id"):
+                    rows = conn.execute(
+                        "SELECT id, status, review_note FROM matches "
+                        "WHERE invoice_id = ? AND id != ? AND status = 'conflict'",
+                        (m["invoice_id"], match_id),
+                    ).fetchall()
+                    for r in rows:
+                        conn.execute(
+                            "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                            "VALUES (?, ?, 'auto_rejected', ?, ?, ?)",
+                            (r["id"], batch_id, note, r["status"], r["review_note"]),
+                        )
                     conn.execute(
                         "UPDATE matches SET status = 'rejected', adjudication = 'auto_rejected' "
                         "WHERE invoice_id = ? AND id != ? AND status = 'conflict'",
                         (m["invoice_id"], match_id),
                     )
                 if m.get("payment_id"):
+                    rows = conn.execute(
+                        "SELECT id, status, review_note FROM matches "
+                        "WHERE payment_id = ? AND id != ? AND status = 'conflict'",
+                        (m["payment_id"], match_id),
+                    ).fetchall()
+                    for r in rows:
+                        conn.execute(
+                            "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                            "VALUES (?, ?, 'auto_rejected', ?, ?, ?)",
+                            (r["id"], batch_id, note, r["status"], r["review_note"]),
+                        )
                     conn.execute(
                         "UPDATE matches SET status = 'rejected', adjudication = 'auto_rejected' "
                         "WHERE payment_id = ? AND id != ? AND status = 'conflict'",
@@ -355,15 +473,18 @@ def revoke(batch):
 def export_cmd(batch, output):
     """导出差异清单 (CSV)
 
-    批次状态须为 reviewed。导出为原子写入，不会产生半截文件。
-    导出后批次状态变为 exported。
+    仅导出需要处理的差异记录，零差额且已确认的正常匹配不会导出。
+    导出记录包含: 冲突、未解决、已拒绝、以及有差额的已确认匹配。
+
+    批次状态须为 reviewed 或 exported。导出为原子写入，不会产生半截文件。
+    导出后批次状态变为 exported（可重复导出覆盖）。
     """
     b = db.get_batch(batch)
     if b is None:
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
         raise SystemExit(1)
-    if b.status != BatchStatus.REVIEWED:
-        click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 reviewed 状态可导出", err=True)
+    if b.status not in (BatchStatus.REVIEWED, BatchStatus.EXPORTED):
+        click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 reviewed/exported 状态可导出", err=True)
         raise SystemExit(1)
 
     all_matches = db.get_matches_by_batch(batch)
@@ -371,15 +492,23 @@ def export_cmd(batch, output):
         click.echo(f"错误: 批次 {batch} 无匹配记录", err=True)
         raise SystemExit(1)
 
+    diff_matches = [
+        m for m in all_matches
+        if not (m["status"] == MatchStatus.CONFIRMED and abs(m["amount_diff"]) < 0.001)
+    ]
+    if not diff_matches:
+        click.echo(f"批次 {batch} 无差异记录（全部为零差额已确认匹配）")
+        raise SystemExit(1)
+
     try:
-        out_path = export.export_differences(output, all_matches)
+        out_path = export.export_differences(output, diff_matches)
     except Exception as e:
         click.echo(f"导出失败: {e}", err=True)
         raise SystemExit(1)
 
     db.update_batch_status(batch, BatchStatus.EXPORTED)
     click.echo(f"差异清单已导出: {out_path}")
-    click.echo(f"  匹配记录: {len(all_matches)} 条")
+    click.echo(f"  差异记录: {len(diff_matches)} 条（共 {len(all_matches)} 条匹配中过滤掉 {len(all_matches) - len(diff_matches)} 条零差额已确认记录")
 
 
 @cli.command("list")

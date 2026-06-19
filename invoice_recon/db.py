@@ -69,6 +69,8 @@ CREATE TABLE IF NOT EXISTS adjudications (
     batch_id INTEGER NOT NULL,
     action TEXT NOT NULL,
     note TEXT,
+    prev_status TEXT,
+    prev_note TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (match_id) REFERENCES matches(id),
     FOREIGN KEY (batch_id) REFERENCES batches(id)
@@ -98,8 +100,17 @@ def init_db(db_path: Optional[str] = None) -> None:
                 "INSERT OR IGNORE INTO rule_versions (version, tolerance, require_vendor_match) "
                 "VALUES ('v1', 0.01, 1)"
             )
+            _migrate_adj_prev_status(conn)
     finally:
         conn.close()
+
+
+def _migrate_adj_prev_status(conn) -> None:
+    cols = [r["name"] for r in conn.execute("PRAGMA table_info(adjudications)").fetchall()]
+    if "prev_status" not in cols:
+        conn.execute("ALTER TABLE adjudications ADD COLUMN prev_status TEXT")
+    if "prev_note" not in cols:
+        conn.execute("ALTER TABLE adjudications ADD COLUMN prev_note TEXT")
 
 
 def get_current_rule(db_path: Optional[str] = None) -> RuleVersion:
@@ -334,15 +345,43 @@ def update_match(match_id: int, status: str, adjudication: Optional[str],
 
 def insert_adjudication(match_id: int, batch_id: int, action: str,
                         note: Optional[str],
+                        prev_status: Optional[str] = None,
+                        prev_note: Optional[str] = None,
                         db_path: Optional[str] = None) -> None:
     conn = connect(db_path)
     try:
         with conn:
             conn.execute(
-                "INSERT INTO adjudications (match_id, batch_id, action, note) "
-                "VALUES (?, ?, ?, ?)",
-                (match_id, batch_id, action, note),
+                "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (match_id, batch_id, action, note, prev_status, prev_note),
             )
+    finally:
+        conn.close()
+
+
+def get_latest_adjudication(match_id: int,
+                            db_path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM adjudications WHERE match_id = ? ORDER BY id DESC LIMIT 1",
+            (match_id,),
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_adjudication_by_id(adj_id: int,
+                           db_path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM adjudications WHERE id = ?",
+            (adj_id,),
+        ).fetchone()
+        return dict(row) if row else None
     finally:
         conn.close()
 

@@ -13,7 +13,21 @@ class ValidationError(Exception):
         super().__init__("\n".join(errors))
 
 
-def parse_invoices(filepath: str) -> List[Invoice]:
+class ParseResult:
+    def __init__(self, items: List, errors: List[str]):
+        self.items = items
+        self.errors = errors
+
+    @property
+    def ok(self) -> bool:
+        return len(self.errors) == 0
+
+    @property
+    def has_items(self) -> bool:
+        return len(self.items) > 0
+
+
+def parse_invoices(filepath: str) -> ParseResult:
     errors: List[str] = []
     rows = _read_csv(filepath)
     if not rows:
@@ -33,10 +47,10 @@ def parse_invoices(filepath: str) -> List[Invoice]:
         date_str = row["date"].strip()
 
         if not inv_no:
-            errors.append(f"第 {i} 行: 发票号为空")
+            errors.append(f"第 {i} 行: 发票号为空，跳过")
             continue
         if inv_no in seen_nos:
-            errors.append(f"第 {i} 行: 发票号 {inv_no} 与第 {seen_nos[inv_no]} 行重复")
+            errors.append(f"第 {i} 行: 发票号 {inv_no} 与第 {seen_nos[inv_no]} 行重复，跳过")
             continue
         seen_nos[inv_no] = i
 
@@ -46,10 +60,10 @@ def parse_invoices(filepath: str) -> List[Invoice]:
             continue
 
         if not vendor:
-            errors.append(f"第 {i} 行: 供应商为空")
+            errors.append(f"第 {i} 行: 供应商为空，跳过")
             continue
         if not date_str:
-            errors.append(f"第 {i} 行: 日期为空")
+            errors.append(f"第 {i} 行: 日期为空，跳过")
             continue
 
         invoices.append(Invoice(
@@ -59,12 +73,10 @@ def parse_invoices(filepath: str) -> List[Invoice]:
             date=date_str,
         ))
 
-    if errors:
-        raise ValidationError(errors)
-    return invoices
+    return ParseResult(invoices, errors)
 
 
-def parse_payments(filepath: str) -> List[Payment]:
+def parse_payments(filepath: str) -> ParseResult:
     errors: List[str] = []
     rows = _read_csv(filepath)
     if not rows:
@@ -84,10 +96,10 @@ def parse_payments(filepath: str) -> List[Payment]:
         date_str = row["date"].strip()
 
         if not pay_no:
-            errors.append(f"第 {i} 行: 付款编号为空")
+            errors.append(f"第 {i} 行: 付款编号为空，跳过")
             continue
         if pay_no in seen_nos:
-            errors.append(f"第 {i} 行: 付款编号 {pay_no} 与第 {seen_nos[pay_no]} 行重复")
+            errors.append(f"第 {i} 行: 付款编号 {pay_no} 与第 {seen_nos[pay_no]} 行重复，跳过")
             continue
         seen_nos[pay_no] = i
 
@@ -97,10 +109,10 @@ def parse_payments(filepath: str) -> List[Payment]:
             continue
 
         if not vendor:
-            errors.append(f"第 {i} 行: 供应商为空")
+            errors.append(f"第 {i} 行: 供应商为空，跳过")
             continue
         if not date_str:
-            errors.append(f"第 {i} 行: 日期为空")
+            errors.append(f"第 {i} 行: 日期为空，跳过")
             continue
 
         payments.append(Payment(
@@ -110,9 +122,7 @@ def parse_payments(filepath: str) -> List[Payment]:
             date=date_str,
         ))
 
-    if errors:
-        raise ValidationError(errors)
-    return payments
+    return ParseResult(payments, errors)
 
 
 def _parse_amount(raw: str, line: int, label: str) -> Tuple[float, str]:
@@ -120,9 +130,9 @@ def _parse_amount(raw: str, line: int, label: str) -> Tuple[float, str]:
     try:
         val = float(raw)
     except (ValueError, TypeError):
-        return 0.0, f"第 {line} 行: {label}金额不是有效数字 '{raw}'"
+        return 0.0, f"第 {line} 行: {label}金额不是有效数字 '{raw}'，跳过"
     if val < 0:
-        return 0.0, f"第 {line} 行: {label}金额不能为负数 '{raw}'"
+        return 0.0, f"第 {line} 行: {label}金额不能为负数 '{raw}'，跳过"
     return round(val, 2), ""
 
 
