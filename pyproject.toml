@@ -1,0 +1,16 @@
+[project]
+name = "invoice-recon"
+version = "1.0.0"
+description = "Offline invoice reconciliation CLI"
+requires-python = ">=3.10"
+dependencies = ["click>=8.1"]
+
+[project.scripts]
+inv-recon = "invoice_recon.cli:cli"
+
+[tool.setuptools.packages.find]
+include = ["invoice_recon*"]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"

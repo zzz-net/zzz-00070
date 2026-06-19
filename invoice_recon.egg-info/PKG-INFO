@@ -1,0 +1,6 @@
+Metadata-Version: 2.4
+Name: invoice-recon
+Version: 1.0.0
+Summary: Offline invoice reconciliation CLI
+Requires-Python: >=3.10
+Requires-Dist: click>=8.1

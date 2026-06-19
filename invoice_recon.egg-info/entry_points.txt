@@ -1,0 +1,2 @@
+[console_scripts]
+inv-recon = invoice_recon.cli:cli

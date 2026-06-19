@@ -1,0 +1,7 @@
+payment_no,vendor,amount,date
+INV-001,ACME Corp,1000.00,2024-01-20
+PAY-002,Globex Inc,2500.00,2024-02-05
+PAY-003,Initech,750.50,2024-02-15
+PAY-004,ACME Corp,1199.99,2024-03-10
+PAY-005A,Wayne Enterprises,1500.00,2024-03-20
+PAY-005B,Wayne Enterprises,1500.00,2024-03-22

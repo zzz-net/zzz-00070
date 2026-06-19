@@ -1,0 +1,4 @@
+invoice_no,vendor,amount,date
+INV-101,ACME Corp,one thousand,2024-01-15
+INV-102,Globex Inc,2500.00,2024-02-01
+INV-101,ACME Corp,1000.00,2024-01-15

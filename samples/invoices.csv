@@ -1,0 +1,7 @@
+invoice_no,vendor,amount,date
+INV-001,ACME Corp,1000.00,2024-01-15
+INV-002,Globex Inc,2500.00,2024-02-01
+INV-003,Initech,750.50,2024-02-10
+INV-004,ACME Corp,1200.00,2024-03-01
+INV-005,Wayne Enterprises,1500.00,2024-03-15
+INV-006,Stark Industries,500.00,2024-04-01
