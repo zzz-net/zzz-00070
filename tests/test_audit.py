@@ -887,5 +887,366 @@ class AuditSameNameExportConflictTest(unittest.TestCase):
             self.assertEqual(f.read(), "existing content")
 
 
+class AuditFilterByBatchNameTest(unittest.TestCase):
+    """按批次名筛选审计记录。"""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_bname_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.snap_dir = os.path.join(self.tmpdir, "snapshots")
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+        self._invoke("init")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for env_var in ("INV_RECON_DB", "INV_RECON_SNAPSHOT_DIR"):
+            if env_var in os.environ:
+                del os.environ[env_var]
+
+    def _invoke(self, *args, **kwargs):
+        return self.runner.invoke(cli, args, **kwargs)
+
+    def test_filter_by_batch_name_exact(self):
+        """按批次名精确筛选审计记录。"""
+        inv = str(SAMPLES_DIR / "invoices.csv")
+        pay = str(SAMPLES_DIR / "payments.csv")
+
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "alpha_batch")
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "beta_batch")
+
+        r = self._invoke("audit", "list", "--batch-name", "alpha")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("alpha_batch", r.output)
+        self.assertNotIn("beta_batch", r.output)
+
+    def test_filter_by_batch_name_partial(self):
+        """按批次名模糊筛选审计记录。"""
+        inv = str(SAMPLES_DIR / "invoices.csv")
+        pay = str(SAMPLES_DIR / "payments.csv")
+
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "my_batch_01")
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "my_batch_02")
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "other_thing")
+
+        records = audit.query_audit(batch_name="my_batch", db_path=self.db_path)
+        self.assertEqual(len(records), 2)
+        for r in records:
+            self.assertIn("my_batch", r["batch_name"])
+
+    def test_filter_by_batch_name_none(self):
+        """按不存在的批次名筛选返回空。"""
+        records = audit.query_audit(batch_name="nonexistent_batch", db_path=self.db_path)
+        self.assertEqual(len(records), 0)
+
+
+class AuditBlockedRecordsTest(unittest.TestCase):
+    """被配置拦下的审计记录测试。"""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_blocked_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.snap_dir = os.path.join(self.tmpdir, "snapshots")
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+        self._invoke("init")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for env_var in ("INV_RECON_DB", "INV_RECON_SNAPSHOT_DIR"):
+            if env_var in os.environ:
+                del os.environ[env_var]
+
+    def _invoke(self, *args, **kwargs):
+        return self.runner.invoke(cli, args, **kwargs)
+
+    def test_match_blocked_invalid_status(self):
+        """状态不对的匹配被拦下并留下审计记录。"""
+        inv = str(SAMPLES_DIR / "invoices.csv")
+        pay = str(SAMPLES_DIR / "payments.csv")
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "block_test")
+        self._invoke("match", "--batch", "1")
+
+        self._invoke("match", "--batch", "1")
+
+        blocked = audit.query_audit(action="match", result="blocked", db_path=self.db_path)
+        self.assertGreater(len(blocked), 0)
+        self.assertEqual(blocked[0]["result"], "blocked")
+        detail = blocked[0].get("detail", {})
+        self.assertEqual(detail.get("blocked_reason"), "invalid_batch_status")
+
+    def test_revoke_blocked_not_found(self):
+        """撤销不存在的批次被拦下。"""
+        self._invoke("revoke", "--batch", "9999")
+
+        blocked = audit.query_audit(action="revoke", result="blocked", db_path=self.db_path)
+        self.assertGreater(len(blocked), 0)
+        self.assertEqual(blocked[0]["result"], "blocked")
+
+    def test_export_blocked_invalid_status(self):
+        """状态不对的导出被拦下并留下审计记录。"""
+        inv = str(SAMPLES_DIR / "invoices.csv")
+        pay = str(SAMPLES_DIR / "payments.csv")
+        self._invoke("import", "--invoices", inv, "--payments", pay, "--name", "export_block_test")
+
+        out = os.path.join(self.tmpdir, "should_not_exist.csv")
+        self._invoke("export", "--batch", "1", "--output", out)
+
+        blocked = audit.query_audit(action="export", result="blocked", db_path=self.db_path)
+        self.assertGreater(len(blocked), 0)
+        detail = blocked[0].get("detail", {})
+        self.assertEqual(detail.get("blocked_reason"), "invalid_batch_status")
+
+    def test_blocked_records_searchable(self):
+        """被拦下的记录可通过结果筛选检索。"""
+        self._invoke("revoke", "--batch", "9998")
+        self._invoke("revoke", "--batch", "9999")
+
+        r = self._invoke("audit", "list", "--result", "blocked")
+        self.assertEqual(r.exit_code, 0)
+        self.assertIn("blocked", r.output)
+
+    def test_import_blocked_precheck(self):
+        """导入预检失败被拦下并留下审计记录。"""
+        bad_csv = os.path.join(self.tmpdir, "bad.csv")
+        with open(bad_csv, "w", encoding="utf-8") as f:
+            f.write("not,a,valid,format\n")
+            f.write("x,y,z\n")
+
+        inv = str(SAMPLES_DIR / "invoices.csv")
+        self._invoke("import", "--invoices", bad_csv, "--payments", inv, "--name", "precheck_fail")
+
+        blocked = audit.query_audit(action="import", result="blocked", db_path=self.db_path)
+        self.assertGreater(len(blocked), 0)
+        detail = blocked[0].get("detail", {})
+        self.assertEqual(detail.get("blocked_reason"), "import_precheck_failed")
+
+
+class AuditErrorTracebackTest(unittest.TestCase):
+    """异常链路追踪测试。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_traceback_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        db.init_db(self.db_path)
+        audit.init_audit_db(self.db_path)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_exception_in_audit_record(self):
+        """异常对象被记录到审计记录中。"""
+        try:
+            raise ValueError("测试异常信息")
+        except ValueError as e:
+            rid = audit.log_audit(
+                action="export",
+                result="error",
+                exception=e,
+                db_path=self.db_path,
+            )
+
+        record = audit.get_audit_record(rid, db_path=self.db_path)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["result"], "error")
+        self.assertEqual(record["error_message"], "测试异常信息")
+        detail = record.get("detail", {})
+        self.assertEqual(detail.get("error_type"), "ValueError")
+        self.assertIn("error_traceback", detail)
+        self.assertIn("测试异常信息", detail["error_traceback"])
+
+    def test_invalid_result_rejected(self):
+        """非法 result 类型被拒绝。"""
+        with self.assertRaises(ValueError):
+            audit.log_audit(action="import", result="invalid_result", db_path=self.db_path)
+
+    def test_valid_results_accepted(self):
+        """所有合法 result 类型都被接受。"""
+        for result in audit.VALID_RESULTS:
+            rid = audit.log_audit(
+                action="import",
+                result=result,
+                db_path=self.db_path,
+            )
+            self.assertGreater(rid, 0)
+            record = audit.get_audit_record(rid, db_path=self.db_path)
+            self.assertEqual(record["result"], result)
+
+
+class AuditFailedExportTest(unittest.TestCase):
+    """失败导出审计记录测试。"""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_failed_export_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.snap_dir = os.path.join(self.tmpdir, "snapshots")
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+        self._invoke("init")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for env_var in ("INV_RECON_DB", "INV_RECON_SNAPSHOT_DIR"):
+            if env_var in os.environ:
+                del os.environ[env_var]
+
+    def _invoke(self, *args, **kwargs):
+        return self.runner.invoke(cli, args, **kwargs)
+
+    def test_export_dir_not_found_error(self):
+        """导出到不存在的目录时报错且有完整错误信息。"""
+        out = os.path.join(self.tmpdir, "nonexistent_dir", "audit.csv")
+        r = self._invoke("audit", "export", "--output", out, "--format", "csv")
+        self.assertNotEqual(r.exit_code, 0)
+        self.assertIn("不存在", r.output)
+        self.assertIn("请先创建目录", r.output)
+
+    def test_export_no_partial_on_error(self):
+        """导出失败时不留下半截文件。"""
+        out_dir = os.path.join(self.tmpdir, "outputs")
+        os.makedirs(out_dir, exist_ok=True)
+
+        out = os.path.join(out_dir, "audit.csv")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("ORIGINAL_CONTENT")
+
+        r = self._invoke("audit", "export", "--output", out, "--format", "csv")
+        self.assertNotEqual(r.exit_code, 0)
+
+        with open(out, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), "ORIGINAL_CONTENT")
+
+    def test_export_path_is_dir_error(self):
+        """导出路径是目录时报错。"""
+        out_dir = os.path.join(self.tmpdir, "not_a_file")
+        os.makedirs(out_dir, exist_ok=True)
+
+        r = self._invoke("audit", "export", "--output", out_dir, "--format", "csv")
+        self.assertNotEqual(r.exit_code, 0)
+
+
+class AuditCrossRestartEnhancedTest(unittest.TestCase):
+    """增强版跨重启查询测试——覆盖失败/被拦截记录。"""
+
+    def setUp(self):
+        self.runner = CliRunner()
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_xrestart2_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.snap_dir = os.path.join(self.tmpdir, "snapshots")
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+        self._invoke("init")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        for env_var in ("INV_RECON_DB", "INV_RECON_SNAPSHOT_DIR"):
+            if env_var in os.environ:
+                del os.environ[env_var]
+
+    def _invoke(self, *args, **kwargs):
+        return self.runner.invoke(cli, args, **kwargs)
+
+    def test_blocked_records_survive_restart(self):
+        """被拦下的记录跨重启后仍可查询。"""
+        self._invoke("revoke", "--batch", "9999")
+
+        before = audit.query_audit(action="revoke", result="blocked", db_path=self.db_path)
+        self.assertGreater(len(before), 0)
+
+        del os.environ["INV_RECON_DB"]
+        os.environ["INV_RECON_DB"] = self.db_path
+
+        after = audit.query_audit(action="revoke", result="blocked", db_path=self.db_path)
+        self.assertEqual(len(after), len(before))
+        self.assertEqual(after[0]["id"], before[0]["id"])
+
+    def test_config_change_audited_across_restart(self):
+        """配置变更审计记录跨重启可查。"""
+        self._invoke("audit", "config", "--retention-days", "90")
+
+        before = audit.query_audit(action="config", db_path=self.db_path)
+        self.assertGreater(len(before), 0)
+
+        del os.environ["INV_RECON_DB"]
+        os.environ["INV_RECON_DB"] = self.db_path
+
+        after = audit.query_audit(action="config", db_path=self.db_path)
+        self.assertGreater(len(after), 0)
+
+    def test_undo_lookback_across_restart(self):
+        """撤销后回看记录跨重启保留。"""
+        inv_csv = os.path.join(self.tmpdir, "inv.csv")
+        pay_csv = os.path.join(self.tmpdir, "pay.csv")
+        _write_csv(
+            Path(inv_csv),
+            ["invoice_no", "vendor", "amount", "date"],
+            [
+                ["INV-X1", "VendorX", "1500.00", "2024-01-10"],
+            ],
+        )
+        _write_csv(
+            Path(pay_csv),
+            ["payment_no", "vendor", "amount", "date"],
+            [
+                ["PAY-X1", "VendorX", "1500.00", "2024-01-15"],
+                ["PAY-X2", "VendorX", "1500.00", "2024-01-16"],
+            ],
+        )
+
+        self._invoke("import", "--invoices", inv_csv, "--payments", pay_csv, "--name", "xrestart_undo")
+        self._invoke("match", "--batch", "1")
+
+        matches = db.get_matches_by_batch(1, db_path=self.db_path)
+        conflicts = [m for m in matches if m["status"] == MatchStatus.CONFLICT]
+        if conflicts:
+            self._invoke(
+                "review", "--batch", "1",
+                "--match-id", str(conflicts[0]["id"]),
+                "--action", "confirm", "--note", "确认一次",
+            )
+            self._invoke("review-undo", "--batch", "1", "--match-id", str(conflicts[0]["id"]))
+
+        undo_before = audit.query_audit(action="review-undo", db_path=self.db_path)
+
+        del os.environ["INV_RECON_DB"]
+        os.environ["INV_RECON_DB"] = self.db_path
+
+        undo_after = audit.query_audit(action="review-undo", db_path=self.db_path)
+        self.assertEqual(len(undo_after), len(undo_before))
+        if undo_after:
+            detail = undo_after[0].get("detail", {})
+            self.assertIn("undo_before", detail)
+            self.assertIn("undo_after", detail)
+
+
+class AuditSchemaMigrationTest(unittest.TestCase):
+    """审计表结构迁移测试。"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_audit_migration_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def test_migration_adds_indexes(self):
+        """迁移增加必要的索引。"""
+        db.init_db(self.db_path)
+        audit.init_audit_db(self.db_path)
+
+        conn = db.connect(self.db_path)
+        try:
+            indexes = [r["name"] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='audit_log'"
+            ).fetchall()]
+            self.assertIn("idx_audit_batch_name", indexes)
+            self.assertIn("idx_audit_rule_version", indexes)
+        finally:
+            conn.close()
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -13,14 +13,16 @@
 import csv
 import json
 import os
+import sys
 import tempfile
 import sqlite3
+import traceback
 from typing import Optional, List, Dict
 
 from . import db
 
 
-AUDIT_SCHEMA = """
+AUDIT_SCHEMA_V1 = """
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp TEXT NOT NULL DEFAULT (datetime('now')),
@@ -53,18 +55,45 @@ VALID_ACTIONS = {
     "pack", "unpack", "config",
 }
 
+VALID_RESULTS = {"success", "failure", "blocked", "error"}
+
 DEFAULT_RETENTION_DAYS = 365
 DEFAULT_VERBOSE = True
+
+VERBOSE_MINIMAL_FIELDS = (
+    "conflict_reason", "undo_before", "undo_after",
+    "export_path", "blocked_reason", "error_type",
+)
 
 
 def init_audit_db(db_path: Optional[str] = None) -> None:
     conn = db.connect(db_path)
     try:
         with conn:
-            conn.executescript(AUDIT_SCHEMA)
+            conn.executescript(AUDIT_SCHEMA_V1)
+            _migrate_audit_schema(conn)
             _ensure_config_defaults(conn)
     finally:
         conn.close()
+
+
+def _migrate_audit_schema(conn: sqlite3.Connection) -> None:
+    """迁移审计表结构，确保向后兼容。"""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(audit_log)").fetchall()}
+
+    if "batch_name" not in cols:
+        conn.execute("ALTER TABLE audit_log ADD COLUMN batch_name TEXT")
+
+    if "error_message" not in cols:
+        conn.execute("ALTER TABLE audit_log ADD COLUMN error_message TEXT")
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_batch_name ON audit_log(batch_name)"
+    )
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audit_rule_version ON audit_log(rule_version)"
+    )
 
 
 def _ensure_config_defaults(conn: sqlite3.Connection) -> None:
@@ -115,6 +144,8 @@ def set_audit_config(
     if errors:
         raise ValueError("; ".join(errors))
 
+    old_config = get_audit_config(db_path)
+
     conn = db.connect(db_path)
     try:
         with conn:
@@ -131,7 +162,32 @@ def set_audit_config(
     finally:
         conn.close()
 
-    return get_audit_config(db_path)
+    new_config = get_audit_config(db_path)
+
+    changed = {}
+    if retention_days is not None and old_config.get("retention_days") != retention_days:
+        changed["retention_days"] = {
+            "old": old_config.get("retention_days"),
+            "new": retention_days,
+        }
+    if verbose is not None and old_config.get("verbose") != verbose:
+        changed["verbose"] = {
+            "old": old_config.get("verbose"),
+            "new": verbose,
+        }
+
+    if changed:
+        log_audit(
+            action="config",
+            result="success",
+            detail={
+                "config_type": "audit_config",
+                "changes": changed,
+            },
+            db_path=db_path,
+        )
+
+    return new_config
 
 
 def log_audit(
@@ -144,23 +200,35 @@ def log_audit(
     result: str = "success",
     detail: Optional[Dict] = None,
     error_message: Optional[str] = None,
+    exception: Optional[BaseException] = None,
     db_path: Optional[str] = None,
 ) -> int:
     if action not in VALID_ACTIONS:
         raise ValueError(f"非法操作类型: {action}，合法值: {', '.join(sorted(VALID_ACTIONS))}")
 
+    if result not in VALID_RESULTS:
+        raise ValueError(f"非法结果类型: {result}，合法值: {', '.join(sorted(VALID_RESULTS))}")
+
     init_audit_db(db_path)
 
     config = get_audit_config(db_path)
+    detail_dict = dict(detail) if detail else {}
+
+    if exception is not None:
+        detail_dict["error_type"] = type(exception).__name__
+        detail_dict["error_traceback"] = traceback.format_exc()
+        if error_message is None:
+            error_message = str(exception)
+
     detail_str = None
-    if detail is not None:
+    if detail_dict:
         if config["verbose"]:
-            detail_str = json.dumps(detail, ensure_ascii=False, default=str)
+            detail_str = json.dumps(detail_dict, ensure_ascii=False, default=str)
         else:
             minimal = {}
-            for k in ("conflict_reason", "undo_before", "undo_after", "export_path"):
-                if k in detail:
-                    minimal[k] = detail[k]
+            for k in VERBOSE_MINIMAL_FIELDS:
+                if k in detail_dict:
+                    minimal[k] = detail_dict[k]
             if minimal:
                 detail_str = json.dumps(minimal, ensure_ascii=False, default=str)
 
@@ -185,6 +253,7 @@ def log_audit(
 
 def query_audit(
     batch_id: Optional[int] = None,
+    batch_name: Optional[str] = None,
     operator: Optional[str] = None,
     action: Optional[str] = None,
     result: Optional[str] = None,
@@ -202,6 +271,9 @@ def query_audit(
         if batch_id is not None:
             conditions.append("batch_id = ?")
             params.append(batch_id)
+        if batch_name is not None:
+            conditions.append("batch_name LIKE ?")
+            params.append(f"%{batch_name}%")
         if operator is not None:
             conditions.append("operator = ?")
             params.append(operator)
@@ -299,6 +371,7 @@ def export_audit_report(
     output_path: str,
     fmt: str = "csv",
     batch_id: Optional[int] = None,
+    batch_name: Optional[str] = None,
     operator: Optional[str] = None,
     action: Optional[str] = None,
     result: Optional[str] = None,
@@ -311,6 +384,7 @@ def export_audit_report(
 
     records = query_audit(
         batch_id=batch_id,
+        batch_name=batch_name,
         operator=operator,
         action=action,
         result=result,
@@ -323,21 +397,52 @@ def export_audit_report(
     abs_path = os.path.abspath(output_path)
     dir_path = os.path.dirname(abs_path)
 
-    if dir_path:
-        if not os.path.exists(dir_path):
-            raise FileNotFoundError(f"目标目录不存在: {dir_path}")
-        if not os.access(dir_path, os.W_OK):
-            raise PermissionError(f"目标目录不可写: {dir_path}")
+    if not dir_path:
+        dir_path = "."
+
+    if not os.path.exists(dir_path):
+        raise FileNotFoundError(
+            f"目标目录不存在: {dir_path}，请先创建目录再导出"
+        )
+
+    if not os.path.isdir(dir_path):
+        raise NotADirectoryError(
+            f"目标路径不是目录: {dir_path}"
+        )
+
+    if not os.access(dir_path, os.W_OK):
+        raise PermissionError(
+            f"目标目录不可写: {dir_path}，请检查目录权限后重试"
+        )
 
     if os.path.exists(abs_path):
-        raise FileExistsError(f"目标文件已存在: {abs_path}")
+        if os.path.isdir(abs_path):
+            raise IsADirectoryError(
+                f"目标路径是一个目录: {abs_path}，请指定文件路径"
+            )
+        raise FileExistsError(
+            f"目标文件已存在: {abs_path}，不会覆盖。请更换文件名或删除现有文件后重试"
+        )
+
+    missing_refs = []
+    for r in records:
+        if r.get("batch_id") and not r.get("batch_name"):
+            missing_refs.append(f"记录 #{r['id']}: batch_id={r['batch_id']} 但无批次名")
 
     if not records:
-        if fmt == "csv":
-            _write_csv_atomic(abs_path, [], [])
-        else:
-            _write_json_atomic(abs_path, [])
-        return abs_path
+        warning_detail = "（无匹配的审计记录，将导出空文件）"
+        records_with_note = records
+    else:
+        warning_detail = ""
+        records_with_note = []
+        for r in records:
+            rec = dict(r)
+            detail = rec.get("detail")
+            if isinstance(detail, dict):
+                if not rec.get("batch_name") and rec.get("batch_id"):
+                    detail["_note"] = "关联批次数据缺失，仅保留审计快照"
+                rec["detail"] = detail
+            records_with_note.append(rec)
 
     if fmt == "csv":
         headers = [
@@ -346,7 +451,14 @@ def export_audit_report(
             "rule_version", "result", "detail", "error_message",
         ]
         rows = []
-        for r in records:
+        for r in records_with_note:
+            detail_val = r.get("detail")
+            if isinstance(detail_val, (dict, list)):
+                detail_str = json.dumps(detail_val, ensure_ascii=False, default=str)
+            elif detail_val is not None:
+                detail_str = str(detail_val)
+            else:
+                detail_str = ""
             rows.append([
                 r.get("id", ""),
                 r.get("timestamp", ""),
@@ -357,12 +469,21 @@ def export_audit_report(
                 r.get("match_id", ""),
                 r.get("rule_version", ""),
                 r.get("result", ""),
-                json.dumps(r.get("detail"), ensure_ascii=False) if r.get("detail") else "",
+                detail_str,
                 r.get("error_message", ""),
             ])
         _write_csv_atomic(abs_path, headers, rows)
     else:
-        _write_json_atomic(abs_path, records)
+        export_data = []
+        for r in records_with_note:
+            rec = {}
+            for k, v in r.items():
+                if isinstance(v, (dict, list, str, int, float, bool)) or v is None:
+                    rec[k] = v
+                else:
+                    rec[k] = str(v)
+            export_data.append(rec)
+        _write_json_atomic(abs_path, export_data)
 
     return abs_path
 

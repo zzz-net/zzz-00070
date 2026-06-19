@@ -43,6 +43,17 @@ def import_data(invoices, payments, name, dry_run):
     # 真实导入：复用同一套校验逻辑（先跑一遍 plan，确保校验一致）
     plan_result = plan.plan_import(invoices, payments, name)
     if not plan_result.success:
+        audit.log_audit(
+            action="import",
+            batch_name=plan_result.batch_name or name,
+            result="blocked",
+            error_message="预检未通过",
+            detail={
+                "blocked_reason": "import_precheck_failed",
+                "errors": plan_result.errors,
+                "warnings": plan_result.warnings,
+            },
+        )
         click.echo(f"{rules.PLAN_REAL_IMPORT_FAILED}", err=True)
         click.echo(f"{rules.PLAN_SECTION_ERRORS}:", err=True)
         for e in plan_result.errors:
@@ -221,9 +232,29 @@ def match(batch):
     """
     b = db.get_batch(batch)
     if b is None:
+        audit.log_audit(
+            action="match",
+            batch_id=batch,
+            result="blocked",
+            error_message=f"批次 {batch} 不存在",
+            detail={"blocked_reason": "batch_not_found"},
+        )
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
         raise SystemExit(1)
     if b.status != BatchStatus.IMPORTED:
+        audit.log_audit(
+            action="match",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message=f"批次状态为 {b.status}，仅 imported 状态可执行匹配",
+            detail={
+                "blocked_reason": "invalid_batch_status",
+                "current_status": b.status,
+                "required_status": BatchStatus.IMPORTED,
+            },
+        )
         click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 imported 状态可执行匹配", err=True)
         raise SystemExit(1)
 
@@ -232,6 +263,15 @@ def match(batch):
     payments = db.get_payments_by_batch(batch)
 
     if not invoices and not payments:
+        audit.log_audit(
+            action="match",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message="批次无发票和付款数据",
+            detail={"blocked_reason": "no_data"},
+        )
         click.echo(f"错误: 批次 {batch} 无发票和付款数据", err=True)
         raise SystemExit(1)
 
@@ -614,9 +654,25 @@ def revoke(batch):
     """
     b = db.get_batch(batch)
     if b is None:
+        audit.log_audit(
+            action="revoke",
+            batch_id=batch,
+            result="blocked",
+            error_message=f"批次 {batch} 不存在",
+            detail={"blocked_reason": "batch_not_found"},
+        )
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
         raise SystemExit(1)
     if b.status == BatchStatus.REVOKED:
+        audit.log_audit(
+            action="revoke",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message="批次已撤销，不可重复操作",
+            detail={"blocked_reason": "already_revoked"},
+        )
         click.echo(f"错误: 批次 {batch} 已撤销，不可重复操作", err=True)
         raise SystemExit(1)
 
@@ -654,25 +710,75 @@ def revoke(batch):
 def export_cmd(batch, output):
     b = db.get_batch(batch)
     if b is None:
+        audit.log_audit(
+            action="export",
+            batch_id=batch,
+            result="blocked",
+            error_message=f"批次 {batch} 不存在",
+            detail={"blocked_reason": "batch_not_found"},
+        )
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
         raise SystemExit(1)
     if b.status not in (BatchStatus.MATCHED, BatchStatus.REVIEWED, BatchStatus.EXPORTED):
+        audit.log_audit(
+            action="export",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message=f"批次状态为 {b.status}，仅 matched/reviewed/exported 状态可导出",
+            detail={
+                "blocked_reason": "invalid_batch_status",
+                "current_status": b.status,
+            },
+        )
         click.echo(f"错误: 批次 {batch} 状态为 {b.status}，仅 matched/reviewed/exported 状态可导出", err=True)
         raise SystemExit(1)
 
     all_matches = db.get_matches_by_batch(batch)
     if not all_matches:
+        audit.log_audit(
+            action="export",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message="批次无匹配记录",
+            detail={"blocked_reason": "no_matches"},
+        )
         click.echo(f"错误: 批次 {batch} 无匹配记录", err=True)
         raise SystemExit(1)
 
     diff_matches = [m for m in all_matches if rules.should_export_match(m)]
     if not diff_matches:
+        audit.log_audit(
+            action="export",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="blocked",
+            error_message="批次无待处理记录（全部为零差额已确认或已拒绝）",
+            detail={"blocked_reason": "nothing_to_export"},
+        )
         click.echo(f"批次 {batch} 无待处理记录（全部为零差额已确认或已拒绝）")
         raise SystemExit(1)
 
     try:
         out_path = export.export_differences(output, diff_matches)
     except Exception as e:
+        audit.log_audit(
+            action="export",
+            batch_id=batch,
+            batch_name=b.name,
+            rule_version=b.rule_version,
+            result="error",
+            error_message=str(e),
+            exception=e,
+            detail={
+                "export_path": output,
+                "exported_count": len(diff_matches),
+            },
+        )
         click.echo(f"导出失败: {e}", err=True)
         raise SystemExit(1)
 
@@ -1217,21 +1323,23 @@ def audit_cmd():
 
 @audit_cmd.command("list", help=rules.AUDIT_LIST_HELP)
 @click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--batch-name", default=None, help="按批次名称模糊筛选")
 @click.option("--operator", default=None, help="按操作者筛选")
 @click.option("--action", "action_type", default=None,
               type=click.Choice(sorted(audit.VALID_ACTIONS)),
               help="按动作类型筛选")
 @click.option("--result", default=None,
-              type=click.Choice(["success", "failure"]),
+              type=click.Choice(sorted(audit.VALID_RESULTS)),
               help="按结果筛选")
 @click.option("--from", "time_start", default=None,
               help="起始时间（ISO 格式，如 2024-01-01 或 2024-01-01T00:00:00）")
 @click.option("--to", "time_end", default=None,
               help="截止时间（ISO 格式）")
 @click.option("--limit", default=50, type=int, help="返回条数上限（默认 50）")
-def audit_list(batch, operator, action_type, result, time_start, time_end, limit):
+def audit_list(batch, batch_name, operator, action_type, result, time_start, time_end, limit):
     records = audit.query_audit(
         batch_id=batch,
+        batch_name=batch_name,
         operator=operator,
         action=action_type,
         result=result,
@@ -1245,9 +1353,9 @@ def audit_list(batch, operator, action_type, result, time_start, time_end, limit
 
     click.echo(
         f"{'ID':>6}  {'时间':<20} {'动作':<16} {'操作者':<10} "
-        f"{'批次ID':>6} {'批次名':<20} {'匹配ID':>6} {'规则':<6} {'结果':<8}"
+        f"{'批次ID':>6} {'批次名':<20} {'匹配ID':>6} {'规则':<6} {'结果':<10}"
     )
-    click.echo("-" * 110)
+    click.echo("-" * 112)
     for r in records:
         click.echo(
             f"{r['id']:>6}  {r['timestamp'][:19]:<20} {r['action']:<16} "
@@ -1256,7 +1364,7 @@ def audit_list(batch, operator, action_type, result, time_start, time_end, limit
             f"{r.get('batch_name', '') or '':<20} "
             f"{r.get('match_id', '') or '':>6} "
             f"{r.get('rule_version', '') or '':<6} "
-            f"{r['result']:<8}"
+            f"{r['result']:<10}"
         )
 
 
@@ -1303,39 +1411,41 @@ def audit_show(record_id):
 @click.option("--format", "fmt", type=click.Choice(["csv", "json"]),
               default="csv", help="导出格式（默认 csv）")
 @click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--batch-name", default=None, help="按批次名称模糊筛选")
 @click.option("--operator", default=None, help="按操作者筛选")
 @click.option("--action", "action_type", default=None,
               type=click.Choice(sorted(audit.VALID_ACTIONS)),
               help="按动作类型筛选")
 @click.option("--result", default=None,
-              type=click.Choice(["success", "failure"]),
+              type=click.Choice(sorted(audit.VALID_RESULTS)),
               help="按结果筛选")
 @click.option("--from", "time_start", default=None,
               help="起始时间（ISO 格式）")
 @click.option("--to", "time_end", default=None,
               help="截止时间（ISO 格式）")
-def audit_export(output, fmt, batch, operator, action_type, result, time_start, time_end):
+def audit_export(output, fmt, batch, batch_name, operator, action_type, result, time_start, time_end):
     try:
         out_path = audit.export_audit_report(
             output_path=output,
             fmt=fmt,
             batch_id=batch,
+            batch_name=batch_name,
             operator=operator,
             action=action_type,
             result=result,
             time_start=time_start,
             time_end=time_end,
         )
-    except FileExistsError:
-        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_FILE_EXISTS}: {output}", err=True)
+    except FileExistsError as e:
+        click.echo(f"错误: {e}", err=True)
         raise SystemExit(1)
     except FileNotFoundError as e:
-        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_DIR_NOT_FOUND}: {e}", err=True)
+        click.echo(f"错误: {e}", err=True)
         raise SystemExit(1)
     except PermissionError as e:
-        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_DIR_NOT_WRITABLE}: {e}", err=True)
+        click.echo(f"错误: {e}", err=True)
         raise SystemExit(1)
-    except ValueError as e:
+    except (ValueError, IsADirectoryError, NotADirectoryError) as e:
         click.echo(f"错误: {e}", err=True)
         raise SystemExit(1)
 
