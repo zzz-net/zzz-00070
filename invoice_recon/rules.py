@@ -150,6 +150,49 @@ REVIEW_UNDO_RULES_HELP = (
 
 
 # ---------------------------------------------------------------------------
+# 快照规则
+# ---------------------------------------------------------------------------
+
+SNAPSHOT_RULES_HELP = (
+    "批次快照与恢复命令组。\n\n"
+    "快照可保存某个批次的完整状态（含规则版本、匹配结果、人工裁决、备注），\n"
+    "换终端或重启后可恢复继续复核或重新导出。\n\n"
+    "子命令: create / list / show / restore"
+)
+
+SNAPSHOT_CREATE_HELP = (
+    "为指定批次创建快照。\n\n"
+    "【快照包含】\n"
+    "  - 批次基本信息和状态\n"
+    "  - 所使用的规则版本\n"
+    "  - 全部发票和付款数据\n"
+    "  - 匹配结果和裁决备注\n"
+    "  - 完整裁决历史（状态链路不丢失）\n\n"
+    "【可建快照的状态】matched / reviewed / exported / revoked（任意状态都可建）"
+)
+
+SNAPSHOT_LIST_HELP = "列出所有快照，按创建时间倒序。"
+
+SNAPSHOT_SHOW_HELP = "显示指定快照的详情（元信息 + 匹配记录概览）。"
+
+SNAPSHOT_RESTORE_HELP = (
+    "将快照恢复为新批次。\n\n"
+    "【恢复规则】\n"
+    "  - 总是作为全新批次导入，绝不覆盖现有批次数据；\n"
+    "  - 所有 ID 重新分配，裁决历史完整保留，状态链路不丢失；\n"
+    "  - 同名批次自动重命名（添加 _2、_3 后缀）；\n"
+    "  - 快照对应的规则版本如库里不存在则自动创建；\n"
+    "  - 已撤销 (revoked) 的批次快照，恢复后保持 revoked 状态；\n"
+    "  - 恢复后可继续 review / review-undo / export。"
+)
+
+SNAPSHOT_OK_CREATED = "快照已创建"
+SNAPSHOT_OK_RESTORED = "快照已恢复为新批次"
+SNAPSHOT_RENAMED_HINT = "  提示：同名批次已存在，已自动重命名"
+SNAPSHOT_DIR_DEFAULT = "默认快照目录: ./snapshots/（可通过 INV_RECON_SNAPSHOT_DIR 环境变量指定）"
+
+
+# ---------------------------------------------------------------------------
 # 错误处理速查表（README 表格内容）
 # ---------------------------------------------------------------------------
 
@@ -172,6 +215,10 @@ ERROR_TABLE_ROWS = [
      "旧批次状态保持 imported，不写任何匹配记录"),
     ("review-undo 撤销裁决",
      "合法范围内撤销，相关联 auto_rejected 也恢复；其他记录不变"),
+    ("快照创建",
+     "完整保存批次+规则+匹配+裁决历史；不影响现有批次和数据库"),
+    ("快照恢复",
+     "作为全新批次导入，绝不覆盖现有数据；同名自动重命名；裁决历史完整保留"),
 ]
 
 
@@ -242,6 +289,68 @@ inv-recon review-undo --batch BATCH_ID --match-id MATCH_ID
 """
 
 
+README_SECTION_SNAPSHOT = """\
+## 批次快照与恢复
+
+快照可保存某个批次的完整状态（规则版本、匹配结果、人工裁决、备注、裁决历史），换终端或重启后可恢复继续复核或重新导出。默认快照目录为 `./snapshots/`，可通过环境变量 `INV_RECON_SNAPSHOT_DIR` 指定。
+
+### `inv-recon snapshot create`
+
+```
+inv-recon snapshot create --batch BATCH_ID [--name NAME]
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--batch` | 是 | 批次 ID |
+| `--name` | 否 | 快照名称（默认自动生成） |
+
+为指定批次创建快照。任意状态的批次都可建快照（matched / reviewed / exported / revoked）。
+
+**快照包含：**
+- 批次基本信息和状态
+- 所使用的规则版本
+- 全部发票和付款数据
+- 匹配结果和裁决备注
+- 完整裁决历史（状态链路不丢失）
+
+### `inv-recon snapshot list`
+
+列出所有快照，按创建时间倒序。
+
+### `inv-recon snapshot show`
+
+```
+inv-recon snapshot show --snapshot ID_OR_NAME
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--snapshot` | 是 | 快照 ID（完整或前缀）或快照名称 |
+
+显示指定快照的详情。
+
+### `inv-recon snapshot restore`
+
+```
+inv-recon snapshot restore --snapshot ID_OR_NAME [--batch-name NEW_NAME]
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--snapshot` | 是 | 快照 ID（完整或前缀）或快照名称 |
+| `--batch-name` | 否 | 新批次名称（默认使用快照内的批次名） |
+
+将快照恢复为新批次：
+- 总是作为**全新批次**导入，**绝不覆盖**现有批次数据；
+- 所有 ID 重新分配，裁决历史完整保留，状态链路不丢失；
+- 同名批次自动重命名（添加 `_2`、`_3` 后缀）；
+- 快照对应的规则版本如库里不存在则自动创建；
+- 已撤销 (`revoked`) 的批次快照，恢复后保持 `revoked` 状态；
+- 恢复后可继续 `review` / `review-undo` / `export`。
+"""
+
+
 README_SECTION_STATUS_FLOW = """\
 ## 批次状态流转
 
@@ -279,4 +388,7 @@ PUBLIC_CONTRACTS: List[str] = [
     "review-undo：reviewed/exported 因撤销出现待审 → 批次回到 matched",
     "持久性：重启 CLI 后 show/list/export 状态与操作前一致",
     "导出原子写入：失败不产生半截文件",
+    "快照：包含批次+规则+发票+付款+匹配+完整裁决历史，状态链路不丢失",
+    "快照恢复：总是作为新批次导入，绝不覆盖现有批次，同名自动重命名",
+    "快照恢复后：可继续 review / review-undo / export，状态与建快照时一致",
 ]

@@ -1,0 +1,85 @@
+{
+  "snapshot_id": "0472701917bb452ab320b4042b16d5cf",
+  "snapshot_name": "after_review",
+  "created_at": "2026-06-20T03:10:03.624453",
+  "source_batch_id": 1,
+  "source_batch_name": "partial-batch",
+  "schema_version": 1,
+  "rule_version": {
+    "id": 1,
+    "version": "v1",
+    "tolerance": 0.01,
+    "require_vendor_match": 1,
+    "created_at": "2026-06-19 16:59:37"
+  },
+  "batch": {
+    "id": 1,
+    "name": "partial-batch",
+    "status": "imported",
+    "rule_version": "v1",
+    "created_at": "2026-06-19 16:59:50",
+    "updated_at": "2026-06-19 16:59:50"
+  },
+  "invoices": [
+    {
+      "id": 1,
+      "batch_id": 1,
+      "invoice_no": "INV-102",
+      "vendor": "Globex Inc",
+      "amount": 2500.0,
+      "date": "2024-02-01"
+    }
+  ],
+  "payments": [
+    {
+      "id": 1,
+      "batch_id": 1,
+      "payment_no": "INV-001",
+      "vendor": "ACME Corp",
+      "amount": 1000.0,
+      "date": "2024-01-20"
+    },
+    {
+      "id": 2,
+      "batch_id": 1,
+      "payment_no": "PAY-002",
+      "vendor": "Globex Inc",
+      "amount": 2500.0,
+      "date": "2024-02-05"
+    },
+    {
+      "id": 3,
+      "batch_id": 1,
+      "payment_no": "PAY-003",
+      "vendor": "Initech",
+      "amount": 750.5,
+      "date": "2024-02-15"
+    },
+    {
+      "id": 4,
+      "batch_id": 1,
+      "payment_no": "PAY-004",
+      "vendor": "ACME Corp",
+      "amount": 1199.99,
+      "date": "2024-03-10"
+    },
+    {
+      "id": 5,
+      "batch_id": 1,
+      "payment_no": "PAY-005A",
+      "vendor": "Wayne Enterprises",
+      "amount": 1500.0,
+      "date": "2024-03-20"
+    },
+    {
+      "id": 6,
+      "batch_id": 1,
+      "payment_no": "PAY-005B",
+      "vendor": "Wayne Enterprises",
+      "amount": 1500.0,
+      "date": "2024-03-22"
+    }
+  ],
+  "matches": [],
+  "adjudications": []
+}

@@ -69,6 +69,18 @@ inv-recon export --batch 1 --output diff_2024Q1.csv
 # 8. 撤销整个批次（标记为 revoked，不可逆）
 inv-recon revoke --batch 1
 
+# 9. 创建批次快照（保存完整状态，含裁决历史）
+inv-recon snapshot create --batch 1 --name 2024Q1_after_review
+
+# 10. 列出所有快照
+inv-recon snapshot list
+
+# 11. 查看快照详情
+inv-recon snapshot show --snapshot 2024Q1_after_review
+
+# 12. 从快照恢复为新批次（绝不覆盖现有批次）
+inv-recon snapshot restore --snapshot 2024Q1_after_review --batch-name 2024Q1_restored
+
 # 随时列出所有批次进度
 inv-recon list
 ```
@@ -210,6 +222,55 @@ inv-recon show --batch BATCH_ID
 
 显示批次详情和所有匹配记录（含裁决结果和备注）。
 
+
+## 批次快照与恢复
+
+快照可保存某个批次的完整状态（规则版本、匹配结果、人工裁决、备注、裁决历史），换终端或重启后可恢复继续复核或重新导出。默认快照目录为 \./snapshots/\，可通过环境变量 \INV_RECON_SNAPSHOT_DIR\ 指定。
+
+### \inv-recon snapshot create
+\inv-recon snapshot create --batch BATCH_ID [--name NAME]
+\
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| \--batch\ | 是 | 批次 ID |
+| \--name\ | 否 | 快照名称（默认自动生成） |
+
+为指定批次创建快照。任意状态的批次都可建快照（matched / reviewed / exported / revoked）。
+
+**快照包含：**
+- 批次基本信息和状态
+- 所使用的规则版本
+- 匹配结果和裁决备注
+- 完整裁决历史（状态链路不丢失）
+
+### \inv-recon snapshot list
+列出所有快照，按创建时间倒序。
+
+### \inv-recon snapshot show
+\inv-recon snapshot show --snapshot SNAPSHOT_REF
+\
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| \--snapshot\ | 是 | 快照 ID（完整或前缀）或快照名称 |
+
+显示指定快照的详情。
+
+### \inv-recon snapshot restore
+\inv-recon snapshot restore --snapshot SNAPSHOT_REF [--batch-name NAME]
+\
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| \--snapshot\ | 是 | 快照 ID（完整或前缀）或快照名称 |
+| \--batch-name\ | 否 | 新批次名称（默认使用快照内的批次名） |
+
+将快照恢复为新批次：
+- 总是作为**全新批次**导入，**绝不覆盖**现有批次数据；
+- 所有 ID 重新分配，裁决历史完整保留，状态链路不丢失；
+- 同名批次自动重命名（添加 \_2\、\_3\ 后缀）；
+- 快照对应的规则版本如库里不存在则自动创建；
+- 已撤销 (evoked\) 的批次快照，恢复后保持 evoked\ 状态；
+- 恢复后可继续 eview\ / eview-undo\ / \xport\。
+
 ## 错误处理
 
 | 场景 | 行为 |
@@ -223,6 +284,8 @@ inv-recon show --batch BATCH_ID
 | 导出失败（磁盘/权限等） | 原子写入：不产生半截文件；原导出文件仍在；批次状态不变 |
 | 匹配失败 | 旧批次状态保持 imported，不写任何匹配记录 |
 | review-undo 撤销裁决 | 合法范围内撤销，相关联 auto_rejected 也恢复；其他记录不变 |
+| 快照创建 | 完整保存批次+规则+匹配+裁决历史；不影响现有批次和数据库 |
+| 快照恢复 | 作为全新批次导入，绝不覆盖现有数据；同名自动重命名；裁决历史完整保留 |
 
 ## 持久性
 

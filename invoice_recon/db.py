@@ -360,6 +360,24 @@ def insert_adjudication(match_id: int, batch_id: int, action: str,
         conn.close()
 
 
+def insert_adjudications_bulk(adjudications: List[dict],
+                              db_path: Optional[str] = None) -> None:
+    conn = connect(db_path)
+    try:
+        with conn:
+            conn.executemany(
+                "INSERT INTO adjudications (match_id, batch_id, action, note, prev_status, prev_note) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                [
+                    (a.get("match_id"), a.get("batch_id"), a.get("action"),
+                     a.get("note"), a.get("prev_status"), a.get("prev_note"))
+                    for a in adjudications
+                ],
+            )
+    finally:
+        conn.close()
+
+
 def get_latest_adjudication(match_id: int,
                             db_path: Optional[str] = None) -> Optional[dict]:
     conn = connect(db_path)
@@ -526,6 +544,66 @@ def _row_to_payment(row) -> Payment:
         amount=row["amount"],
         date=row["date"],
     )
+
+
+def get_batch_raw(batch_id: int,
+                  db_path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM batches WHERE id = ?", (batch_id,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_invoices_raw_by_batch(batch_id: int,
+                              db_path: Optional[str] = None) -> List[dict]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM invoices WHERE batch_id = ? ORDER BY id", (batch_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_payments_raw_by_batch(batch_id: int,
+                              db_path: Optional[str] = None) -> List[dict]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM payments WHERE batch_id = ? ORDER BY id", (batch_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_matches_raw_by_batch(batch_id: int,
+                             db_path: Optional[str] = None) -> List[dict]:
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT * FROM matches WHERE batch_id = ? ORDER BY id", (batch_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_rule_version_raw(version: str,
+                         db_path: Optional[str] = None) -> Optional[dict]:
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT * FROM rule_versions WHERE version = ?", (version,)
+        ).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
 
 
 def _row_to_match(row) -> Match:

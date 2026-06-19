@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export, rules
+from . import db, validators, matcher, export, rules, snapshot
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -605,6 +605,104 @@ def show(batch):
         click.echo()
 
 
+@cli.group("snapshot", help=rules.SNAPSHOT_RULES_HELP)
+def snapshot_cmd():
+    """批次快照与恢复命令组。"""
+    pass
+
+
+@snapshot_cmd.command("create", help=rules.SNAPSHOT_CREATE_HELP)
+@click.option("--batch", required=True, type=int, help="批次 ID")
+@click.option("--name", default=None, help="快照名称（默认自动生成）")
+def snapshot_create(batch, name):
+    b = db.get_batch(batch)
+    if b is None:
+        click.echo(f"错误: 批次 {batch} 不存在", err=True)
+        raise SystemExit(1)
+
+    try:
+        info = snapshot.create_snapshot(batch, name=name)
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.SNAPSHOT_OK_CREATED}")
+    click.echo(f"  快照 ID: {info['snapshot_id']}")
+    click.echo(f"  快照名称: {info['snapshot_name']}")
+    click.echo(f"  创建时间: {info['created_at']}")
+    click.echo(f"  源批次: #{info['source_batch_id']} {info['source_batch_name']}")
+    click.echo(f"  批次状态: {info['batch_status']} | 规则: {info['rule_version']}")
+    click.echo(f"  发票: {info['invoice_count']} | 付款: {info['payment_count']} | 匹配: {info['match_count']} | 裁决记录: {info['adjudication_count']}")
+    click.echo(f"  文件: {info['file']}")
+
+
+@snapshot_cmd.command("list", help=rules.SNAPSHOT_LIST_HELP)
+def snapshot_list():
+    snaps = snapshot.list_snapshots()
+    if not snaps:
+        click.echo("暂无快照。")
+        click.echo(rules.SNAPSHOT_DIR_DEFAULT)
+        return
+
+    click.echo(
+        f"{'快照ID':<10} {'名称':<24} {'状态':<10} {'规则':<6} "
+        f"{'匹配':>4} {'创建时间':<20} {'源批次':<20}"
+    )
+    click.echo("-" * 100)
+    for s in snaps:
+        short_id = s["snapshot_id"][:8]
+        source = f"#{s['source_batch_id']} {s['source_batch_name']}" if s.get("source_batch_id") else "N/A"
+        click.echo(
+            f"{short_id:<10} {s['snapshot_name']:<24} {s['batch_status']:<10} {s['rule_version']:<6} "
+            f"{s['match_count']:>4} {s['created_at'][:19]:<20} {source:<20}"
+        )
+
+
+@snapshot_cmd.command("show", help=rules.SNAPSHOT_SHOW_HELP)
+@click.option("--snapshot", "snapshot_ref", required=True, help="快照 ID（完整/前缀）或名称")
+def snapshot_show(snapshot_ref):
+    info = snapshot.get_snapshot_info(snapshot_ref)
+    if info is None:
+        click.echo(f"错误: 快照 {snapshot_ref} 不存在", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"快照 ID: {info['snapshot_id']}")
+    click.echo(f"快照名称: {info['snapshot_name']}")
+    click.echo(f"创建时间: {info['created_at']}")
+    click.echo(f"源批次: #{info['source_batch_id']} {info['source_batch_name']}" if info.get("source_batch_id") else "源批次: N/A")
+    click.echo(f"批次状态: {info['batch_status']}")
+    click.echo(f"规则版本: {info['rule_version']}")
+    click.echo(f"发票: {info['invoice_count']} 条")
+    click.echo(f"付款: {info['payment_count']} 条")
+    click.echo(f"匹配: {info['match_count']} 条")
+    click.echo(f"裁决历史: {info['adjudication_count']} 条")
+
+
+@snapshot_cmd.command("restore", help=rules.SNAPSHOT_RESTORE_HELP)
+@click.option("--snapshot", "snapshot_ref", required=True, help="快照 ID（完整/前缀）或名称")
+@click.option("--batch-name", default=None, help="新批次名称（默认使用快照内批次名）")
+def snapshot_restore(snapshot_ref, batch_name):
+    info = snapshot.get_snapshot_info(snapshot_ref)
+    if info is None:
+        click.echo(f"错误: 快照 {snapshot_ref} 不存在", err=True)
+        raise SystemExit(1)
+
+    try:
+        result = snapshot.restore_snapshot(snapshot_ref, new_batch_name=batch_name)
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.SNAPSHOT_OK_RESTORED}")
+    click.echo(f"  新批次 ID: {result['new_batch_id']}")
+    click.echo(f"  新批次名称: {result['new_batch_name']}")
+    if result["was_renamed"]:
+        click.echo(rules.SNAPSHOT_RENAMED_HINT)
+        click.echo(f"  原名称: {result['original_name']}")
+    click.echo(f"  状态: {result['status']} | 规则: {result['rule_version']}")
+    click.echo(f"  发票: {result['invoice_count']} | 付款: {result['payment_count']} | 匹配: {result['match_count']} | 裁决记录: {result['adjudication_count']}")
+
+
 # ======================================================================
 # 统一为命令函数设置 __doc__ —— 让 --help 显示 rules 模块的共享文案。
 # 必须放在所有命令定义之后（否则函数还不存在）。
@@ -613,3 +711,5 @@ def show(batch):
 import_data.__doc__ = rules.IMPORT_RULES_HELP
 export_cmd.__doc__ = rules.EXPORT_RULES_HELP
 review_undo.__doc__ = rules.REVIEW_UNDO_RULES_HELP
+snapshot_create.__doc__ = rules.SNAPSHOT_CREATE_HELP
+snapshot_restore.__doc__ = rules.SNAPSHOT_RESTORE_HELP
