@@ -311,30 +311,47 @@ def unpack_package(package_path: str,
         base_name = batch_name or original_batch_name
 
         snapshot._ensure_snapshot_dir()
+        snap_dir = snapshot.get_snapshot_dir()
 
+        # 1. 预先解析最终的批次名（处理同名批次冲突）
+        final_batch_name = snapshot._resolve_batch_name(base_name, db_path=db_path)
+        was_renamed = final_batch_name != base_name
+
+        # 2. 用最终批次名生成快照文件名（包含毫秒级时间戳）
         snap_file_name = snapshot._snapshot_filename(
             snap_data["snapshot_id"],
-            base_name + "_imported"
+            final_batch_name + "_imported"
         )
-        snap_dir = snapshot.get_snapshot_dir()
         snap_target = snap_dir / snap_file_name
 
+        # 3. 快照文件名冲突时自动加后缀（即使毫秒级也可能冲突）
         if snap_target.exists() and not force:
-            raise FileExistsError(
-                f"快照文件已存在: {snap_target}。如需覆盖请使用 --force"
-            )
+            i = 2
+            while True:
+                stem = snap_target.stem
+                if stem.endswith((".snap", "")):
+                    stem = stem.replace(".snap", "")
+                candidate = snap_dir / f"{stem}_{i}.snap.json"
+                if not candidate.exists():
+                    snap_target = candidate
+                    snap_file_name = candidate.name
+                    break
+                i += 1
+        elif snap_target.exists() and force:
+            pass  # force 模式直接覆盖
 
+        # 4. 保存快照文件
         snapshot._save_snapshot_file(snap_target, snap_data)
 
+        # 5. 恢复批次（传入预先解析好的名称，避免再次重命名）
         result = snapshot.restore_snapshot(
             snap_data["snapshot_id"],
-            new_batch_name=base_name,
+            new_batch_name=final_batch_name,
             db_path=db_path,
         )
 
         new_batch_id = result["new_batch_id"]
         new_batch_name = result["new_batch_name"]
-        was_renamed = result["was_renamed"]
 
         preserved_records: List[dict] = []
         renamed_records: List[dict] = []

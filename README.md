@@ -83,6 +83,25 @@ inv-recon snapshot restore --snapshot 2024Q1_after_review --batch-name 2024Q1_re
 
 # 随时列出所有批次进度
 inv-recon list
+
+# 13. 打包批次为可搬运包（用于跨机器迁移）
+inv-recon pack --batch 1 --output 2024Q1_transfer.invpkg --name 2024Q1_for_audit
+
+# 14. （可选）在导入前校验包完整性
+inv-recon verify --input 2024Q1_transfer.invpkg
+
+# 15. （可选）查看包元信息（不导入）
+inv-recon inspect --input 2024Q1_transfer.invpkg
+
+# 16. 在新机器/新目录中导入包（自动处理同名冲突）
+inv-recon unpack --input 2024Q1_transfer.invpkg
+
+# 导入后可继续所有操作
+inv-recon list
+inv-recon show --batch 1
+inv-recon review --batch 1 --match-id 2 --action reject --note "跨机器复核"
+inv-recon review-undo --batch 1 --match-id 2
+inv-recon export --batch 1 --output 2024Q1_new_machine.csv
 ```
 
 ## 命令参考

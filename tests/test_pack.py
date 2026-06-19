@@ -20,6 +20,7 @@ import zipfile
 import tempfile
 import shutil
 import unittest
+from unittest import mock
 from io import StringIO
 from pathlib import Path
 
@@ -921,6 +922,203 @@ class ReadmePackExampleFlowTest(unittest.TestCase):
                 self.assertIn("无待处理记录", r.output)
         finally:
             os.environ["INV_RECON_DB"] = self.db_path
+
+
+class RapidReimportTest(unittest.TestCase):
+    """快速重复导入回归测试 —— 覆盖同一秒/毫秒内多次导入的边界情况。
+
+    Bug 根因：
+      1. 快照文件名只用秒级时间戳，同一秒内重复导入会冲突
+      2. 落盘顺序错误：先存快照文件 → 再重命名批次，导致快照名用原始名
+      3. 快照文件名冲突时直接报错，没有自动重试机制
+
+    修复后保证：
+      - 毫秒级时间戳 + 自动加后缀，确保文件名唯一
+      - 预先解析批次名，快照名与批次名一致
+      - 每次导入都生成独立、可操作的批次
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="inv_recon_rapid_")
+        self.db_path = os.path.join(self.tmpdir, "test.db")
+        self.snap_dir = os.path.join(self.tmpdir, "snapshots")
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+        self.runner = CliRunner()
+        self._create_test_package()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+        if "INV_RECON_DB" in os.environ:
+            del os.environ["INV_RECON_DB"]
+        if "INV_RECON_SNAPSHOT_DIR" in os.environ:
+            del os.environ["INV_RECON_SNAPSHOT_DIR"]
+
+    def _create_test_package(self):
+        """创建测试用的 .invpkg 包"""
+        self.runner.invoke(cli, ["init"])
+
+        inv_csv = os.path.join(self.tmpdir, "inv.csv")
+        pay_csv = os.path.join(self.tmpdir, "pay.csv")
+        Path(inv_csv).write_text(
+            "invoice_no,vendor,amount,date\n"
+            "INV-001,ACME,1000.00,2024-01-15\n"
+            "INV-002,ACME,2000.00,2024-01-16\n",
+            encoding="utf-8"
+        )
+        Path(pay_csv).write_text(
+            "payment_no,vendor,amount,date\n"
+            "PAY-001,ACME,1000.00,2024-01-20\n"
+            "PAY-002,ACME,2000.00,2024-01-21\n",
+            encoding="utf-8"
+        )
+
+        self.runner.invoke(cli, ["import", "--invoices", inv_csv, "--payments", pay_csv, "--name", "rapid_test"])
+        self.runner.invoke(cli, ["match", "--batch", "1"])
+        self.runner.invoke(cli, ["review", "--batch", "1", "--match-id", "1", "--action", "confirm", "--note", "核对无误"])
+
+        self.pkg = os.path.join(self.tmpdir, "rapid_test.invpkg")
+        r = self.runner.invoke(cli, ["pack", "--batch", "1", "--output", self.pkg])
+        self.assertEqual(r.exit_code, 0, f"pack failed: {r.output}")
+
+        # 重置数据库用于导入测试
+        os.remove(self.db_path)
+        shutil.rmtree(self.snap_dir, ignore_errors=True)
+
+    def _invoke(self, *args):
+        return self.runner.invoke(cli, args)
+
+    def test_same_millisecond_multiple_imports(self):
+        """同一毫秒内连续导入同一个包 5 次，每次都生成独立批次。
+
+        通过 mock _snapshot_filename 强制返回相同文件名，
+        验证自动加后缀机制正常工作。
+        """
+        self._invoke("init")
+
+        call_count = [0]
+        fixed_name = "20260620_044021_000_rapid_test_imported_abcd1234.snap.json"
+
+        def mock_snapshot_filename(snap_id, name):
+            call_count[0] += 1
+            return fixed_name
+
+        with mock.patch('invoice_recon.snapshot._snapshot_filename', side_effect=mock_snapshot_filename):
+            results = []
+            for i in range(5):
+                r = self._invoke("unpack", "--input", self.pkg)
+                results.append(r)
+                self.assertEqual(r.exit_code, 0,
+                    f"第 {i+1} 次导入失败: {r.output}")
+
+        # 验证 5 个独立批次
+        batches = db.list_batches(db_path=self.db_path)
+        self.assertEqual(len(batches), 5)
+        batch_names = sorted([b["name"] for b in batches])
+        expected_names = ["rapid_test", "rapid_test_2", "rapid_test_3", "rapid_test_4", "rapid_test_5"]
+        self.assertEqual(batch_names, expected_names)
+
+        # 验证 5 个独立快照文件，自动加后缀
+        snaps = sorted(os.listdir(self.snap_dir))
+        self.assertEqual(len(snaps), 5)
+        self.assertEqual(len(set(snaps)), 5)  # 全部唯一
+        self.assertIn(fixed_name, snaps)
+        for i in range(2, 6):
+            self.assertIn(f"abcd1234_{i}.snap.json", snaps[i-1])
+
+    def test_imported_batches_fully_operational(self):
+        """导入后的批次可以正常 list/show/review/review-undo/export。"""
+        self._invoke("init")
+
+        # 连续导入 3 次
+        for _ in range(3):
+            r = self._invoke("unpack", "--input", self.pkg)
+            self.assertEqual(r.exit_code, 0, f"unpack failed: {r.output}")
+
+        batches = db.list_batches(db_path=self.db_path)
+        self.assertEqual(len(batches), 3)
+
+        for i, batch in enumerate(batches, 1):
+            batch_id = batch["id"]
+
+            # list
+            r = self._invoke("list")
+            self.assertEqual(r.exit_code, 0)
+            self.assertIn(batch["name"], r.output)
+
+            # show
+            r = self._invoke("show", "--batch", str(batch_id))
+            self.assertEqual(r.exit_code, 0)
+            self.assertIn(batch["name"], r.output)
+
+            # 找到一个匹配记录
+            matches = db.get_matches_by_batch(batch_id, db_path=self.db_path)
+            self.assertGreater(len(matches), 0)
+            match_id = matches[0]["id"]
+
+            # review
+            r = self._invoke("review", "--batch", str(batch_id),
+                            "--match-id", str(match_id),
+                            "--action", "reject", "--note", f"自动测试 #{i}")
+            self.assertEqual(r.exit_code, 0, f"review failed: {r.output}")
+
+            # review-undo
+            r = self._invoke("review-undo", "--batch", str(batch_id),
+                            "--match-id", str(match_id))
+            self.assertEqual(r.exit_code, 0, f"review-undo failed: {r.output}")
+
+            # export
+            out_path = os.path.join(self.tmpdir, f"export_{batch_id}.csv")
+            r = self._invoke("export", "--batch", str(batch_id), "--output", out_path)
+            self.assertEqual(r.exit_code, 0, f"export failed: {r.output}")
+            self.assertTrue(os.path.exists(out_path))
+
+    def test_cross_restart_reimport_same_package(self):
+        """跨重启后再次导入同包，仍能正常重命名和继续使用。
+
+        模拟场景：导入一次 → 重启程序 → 再次导入同一个包 → 自动重命名。
+        """
+        self._invoke("init")
+
+        # 第一次导入
+        r1 = self._invoke("unpack", "--input", self.pkg)
+        self.assertEqual(r1.exit_code, 0, f"第一次导入失败: {r1.output}")
+
+        # 模拟重启 - 删除旧的环境变量再重新设置（使用相同的 DB）
+        del os.environ["INV_RECON_DB"]
+        del os.environ["INV_RECON_SNAPSHOT_DIR"]
+        os.environ["INV_RECON_DB"] = self.db_path
+        os.environ["INV_RECON_SNAPSHOT_DIR"] = self.snap_dir
+
+        # 第二次导入
+        r2 = self._invoke("unpack", "--input", self.pkg)
+        self.assertEqual(r2.exit_code, 0, f"第二次导入失败: {r2.output}")
+        self.assertIn(rules.PACK_RENAMED_HINT.strip(), r2.output)
+
+        # 第三次导入
+        r3 = self._invoke("unpack", "--input", self.pkg)
+        self.assertEqual(r3.exit_code, 0, f"第三次导入失败: {r3.output}")
+
+        # 验证批次名
+        batches = db.list_batches(db_path=self.db_path)
+        self.assertEqual(len(batches), 3)
+        batch_names = sorted([b["name"] for b in batches])
+        self.assertEqual(batch_names, ["rapid_test", "rapid_test_2", "rapid_test_3"])
+
+        # 验证所有批次可正常操作
+        for i, batch in enumerate(batches, 1):
+            matches = db.get_matches_by_batch(batch["id"], db_path=self.db_path)
+            self.assertGreater(len(matches), 0)
+            match_id = matches[0]["id"]
+
+            r = self._invoke("review", "--batch", str(batch["id"]),
+                            "--match-id", str(match_id),
+                            "--action", "confirm", "--note", f"跨重启测试 #{i}")
+            self.assertEqual(r.exit_code, 0, f"review failed: {r.output}")
+
+            out_path = os.path.join(self.tmpdir, f"cross_export_{i}.csv")
+            r = self._invoke("export", "--batch", str(batch["id"]), "--output", out_path)
+            self.assertEqual(r.exit_code, 0, f"export failed: {r.output}")
 
 
 if __name__ == "__main__":

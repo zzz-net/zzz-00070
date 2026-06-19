@@ -54,7 +54,8 @@ def _sanitize_filename(name: str) -> str:
 
 
 def _snapshot_filename(snap_id: str, name: str) -> str:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    now = datetime.datetime.now()
+    ts = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
     safe_name = _sanitize_filename(name)
     return f"{ts}_{safe_name}_{snap_id[:8]}{SNAPSHOT_FILE_EXT}"
 
