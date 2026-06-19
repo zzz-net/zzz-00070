@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export
+from . import db, validators, matcher, export, rules
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -25,22 +25,14 @@ def init():
     click.echo("数据库已初始化，默认规则版本 v1（容差 0.01，需供应商匹配）")
 
 
-@cli.command("import")
+@cli.command("import", help=rules.IMPORT_RULES_HELP)
 @click.option("--invoices", required=True, type=click.Path(exists=True),
-              help="发票 CSV 文件路径。列: invoice_no,vendor,amount,date")
+              help=rules.IMPORT_INVOICES_HELP)
 @click.option("--payments", required=True, type=click.Path(exists=True),
-              help="付款 CSV 文件路径。列: payment_no,vendor,amount,date")
+              help=rules.IMPORT_PAYMENTS_HELP)
 @click.option("--name", default=None,
               help="批次名称（默认自动生成）")
 def import_data(invoices, payments, name):
-    """导入发票和付款表，创建新批次
-
-    发票 CSV 格式: invoice_no,vendor,amount,date
-    付款 CSV 格式: payment_no,vendor,amount,date
-
-    金额必须为数字，发票号/付款编号在批次内不可重复。
-    存在非法行时跳过并保留合法数据，缺少列或文件为空时整体失败。
-    """
     try:
         inv_result = validators.parse_invoices(invoices)
     except validators.ValidationError as e:
@@ -87,13 +79,13 @@ def import_data(invoices, payments, name):
 
     click.echo(f"批次 {batch_id} 已创建: {name}")
     click.echo(f"  发票: {len(inv_result.items)} 条 | 付款: {len(pay_result.items)} 条 | 规则: {rule.version}")
-    click.echo(f"  旧批次状态未受影响")
+    click.echo(rules.IMPORT_OK_HINT_LEGACY_ROW)
     if inv_result.errors:
-        click.echo(f"  ⚠ 发票跳过 {len(inv_result.errors)} 行（合法数据已正常入库）:")
+        click.echo(f"{rules.IMPORT_OK_HINT_BAD_ROWS_PREFIX} 发票 {len(inv_result.errors)} 行 {rules.IMPORT_OK_HINT_BAD_ROWS_SUFFIX}:")
         for e in inv_result.errors:
             click.echo(f"    - {e}")
     if pay_result.errors:
-        click.echo(f"  ⚠ 付款跳过 {len(pay_result.errors)} 行（合法数据已正常入库）:")
+        click.echo(f"{rules.IMPORT_OK_HINT_BAD_ROWS_PREFIX} 付款 {len(pay_result.errors)} 行 {rules.IMPORT_OK_HINT_BAD_ROWS_SUFFIX}:")
         for e in pay_result.errors:
             click.echo(f"    - {e}")
 
@@ -231,17 +223,10 @@ def review(batch, match_id, action, note):
         click.echo(f"批次 {batch} 仍有 {pending} 条待复核")
 
 
-@cli.command("review-undo")
+@cli.command("review-undo", help=rules.REVIEW_UNDO_RULES_HELP)
 @click.option("--batch", required=True, type=int, help="批次 ID")
 @click.option("--match-id", required=True, type=int, help="匹配记录 ID")
 def review_undo(batch, match_id):
-    """撤销单条匹配的上一次裁决，恢复复核前的状态和备注
-
-    仅能撤销上一次人工裁决（confirm 或 reject）。
-    撤销后该条匹配回到 pending/conflict 状态。
-    如该条是对冲突记录的 confirm，相关联被 auto_rejected 的冲突记录
-    也会一并恢复到 conflict 状态，以便用户重新选择。
-    """
     b = db.get_batch(batch)
     if b is None:
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
@@ -516,22 +501,11 @@ def revoke(batch):
     click.echo(f"批次 {batch} ({b.name}) 已撤销")
 
 
-@cli.command("export")
+@cli.command("export", help=rules.EXPORT_RULES_HELP)
 @click.option("--batch", required=True, type=int, help="批次 ID")
 @click.option("--output", required=True, type=click.Path(),
-              help="导出文件路径 (CSV)")
+              help=rules.EXPORT_OUTPUT_HELP)
 def export_cmd(batch, output):
-    """导出待处理清单 (CSV)
-
-    仅导出还需要处理的记录:
-    - pending / conflict: 待人工复核的未解决记录
-    - 有差额的 confirmed: 已确认但金额有差异，需要后续跟进
-
-    已拒绝 (rejected) 和零差额已确认的记录不导出。
-    批次状态须为 matched / reviewed / exported（含撤销后回到 matched 的情况）。
-    导出为原子写入，不会产生半截文件。
-    导出后批次状态变为 exported（可重复导出覆盖）。
-    """
     b = db.get_batch(batch)
     if b is None:
         click.echo(f"错误: 批次 {batch} 不存在", err=True)
@@ -545,13 +519,7 @@ def export_cmd(batch, output):
         click.echo(f"错误: 批次 {batch} 无匹配记录", err=True)
         raise SystemExit(1)
 
-    diff_matches = [
-        m for m in all_matches
-        if (
-            m["status"] in (MatchStatus.PENDING, MatchStatus.CONFLICT)
-            or (m["status"] == MatchStatus.CONFIRMED and abs(m["amount_diff"]) >= 0.001)
-        )
-    ]
+    diff_matches = [m for m in all_matches if rules.should_export_match(m)]
     if not diff_matches:
         click.echo(f"批次 {batch} 无待处理记录（全部为零差额已确认或已拒绝）")
         raise SystemExit(1)
@@ -563,12 +531,20 @@ def export_cmd(batch, output):
         raise SystemExit(1)
 
     db.update_batch_status(batch, BatchStatus.EXPORTED)
-    click.echo(f"待处理清单已导出: {out_path}")
-    click.echo(
-        f"  待处理记录: {len(diff_matches)} 条"
-        f"（共 {len(all_matches)} 条匹配中过滤掉 "
-        f"{len(all_matches) - len(diff_matches)} 条已拒绝或零差额已确认记录）"
+    click.echo(f"{rules.EXPORT_OK_PREFIX}: {out_path}")
+
+    skipped_rejected = sum(1 for m in all_matches if m["status"] == MatchStatus.REJECTED)
+    skipped_clean = sum(
+        1 for m in all_matches
+        if m["status"] == MatchStatus.CONFIRMED
+        and abs(float(m.get("amount_diff", 0.0))) < 0.001
     )
+    click.echo(rules.EXPORT_OK_BREAKDOWN.format(
+        exported=len(diff_matches),
+        total=len(all_matches),
+        skipped_rejected=skipped_rejected,
+        skipped_clean=skipped_clean,
+    ))
 
 
 @cli.command("list")
@@ -627,3 +603,13 @@ def show(batch):
         if m.get("adjudication"):
             click.echo(f"  裁决: {m['adjudication']}" + (f" — {m['review_note']}" if m.get("review_note") else ""))
         click.echo()
+
+
+# ======================================================================
+# 统一为命令函数设置 __doc__ —— 让 --help 显示 rules 模块的共享文案。
+# 必须放在所有命令定义之后（否则函数还不存在）。
+# 这样做可以保证 README / --help / 实际提示使用同一份文案源。
+# ======================================================================
+import_data.__doc__ = rules.IMPORT_RULES_HELP
+export_cmd.__doc__ = rules.EXPORT_RULES_HELP
+review_undo.__doc__ = rules.REVIEW_UNDO_RULES_HELP

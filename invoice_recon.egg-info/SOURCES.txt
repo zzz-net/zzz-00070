@@ -6,6 +6,7 @@ invoice_recon/db.py
 invoice_recon/export.py
 invoice_recon/matcher.py
 invoice_recon/models.py
+invoice_recon/rules.py
 invoice_recon/validators.py
 invoice_recon.egg-info/PKG-INFO
 invoice_recon.egg-info/SOURCES.txt
@@ -13,4 +14,5 @@ invoice_recon.egg-info/dependency_links.txt
 invoice_recon.egg-info/entry_points.txt
 invoice_recon.egg-info/requires.txt
 invoice_recon.egg-info/top_level.txt
+tests/test_docs_and_export.py
 tests/test_review_undo.py
