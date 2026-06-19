@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export, rules, snapshot, pack, plan
+from . import db, validators, matcher, export, rules, snapshot, pack, plan, audit
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -22,6 +22,7 @@ def cli():
 def init():
     """初始化数据库（创建表结构和默认规则 v1）"""
     db.init_db()
+    audit.init_audit_db()
     click.echo("数据库已初始化，默认规则版本 v1（容差 0.01，需供应商匹配）")
 
 
@@ -92,6 +93,22 @@ def import_data(invoices, payments, name, dry_run):
         click.echo(f"{rules.IMPORT_OK_HINT_BAD_ROWS_PREFIX} 付款 {len(pay_result.errors)} 行 {rules.IMPORT_OK_HINT_BAD_ROWS_SUFFIX}:")
         for e in pay_result.errors:
             click.echo(f"    - {e}")
+
+    audit.log_audit(
+        action="import",
+        batch_id=batch_id,
+        batch_name=final_name,
+        rule_version=rule.version,
+        result="success",
+        detail={
+            "invoice_count": len(inv_result.items),
+            "payment_count": len(pay_result.items),
+            "bad_invoice_count": len(inv_result.errors),
+            "bad_payment_count": len(pay_result.errors),
+            "was_renamed": plan_result.was_renamed,
+            "original_name": plan_result.original_name if plan_result.was_renamed else None,
+        },
+    )
 
 
 def _run_import_dry_run(invoices: str, payments: str, name: str):
@@ -181,6 +198,18 @@ def config(tolerance, require_vendor_match):
     click.echo(f"  金额容差: {new_rule.tolerance}")
     click.echo(f"  需供应商匹配: {'是' if new_rule.require_vendor_match else '否'}")
 
+    audit.log_audit(
+        action="config",
+        rule_version=new_rule.version,
+        result="success",
+        detail={
+            "old_version": current.version,
+            "new_version": new_rule.version,
+            "tolerance": new_rule.tolerance,
+            "require_vendor_match": new_rule.require_vendor_match,
+        },
+    )
+
 
 @cli.command()
 @click.option("--batch", required=True, type=int, help="批次 ID")
@@ -248,6 +277,21 @@ def match(batch):
     if warnings:
         for w in warnings:
             click.echo(f"  ⚠ {w}")
+
+    audit.log_audit(
+        action="match",
+        batch_id=batch,
+        batch_name=b.name,
+        rule_version=b.rule_version,
+        result="success",
+        detail={
+            "exact_count": exact_cnt,
+            "amount_only_count": amt_cnt,
+            "unmatched_invoice_count": uninv_cnt,
+            "unmatched_payment_count": unpay_cnt,
+            "conflict_count": conflict_cnt,
+        },
+    )
 
 
 @cli.command()
@@ -408,6 +452,22 @@ def review_undo(batch, match_id):
     if siblings_restored:
         click.echo(f"  关联冲突记录已恢复可复核: #{', #'.join(str(s) for s in siblings_restored)}")
 
+    audit.log_audit(
+        action="review-undo",
+        batch_id=batch,
+        batch_name=b.name,
+        match_id=match_id,
+        rule_version=b.rule_version,
+        result="success",
+        detail={
+            "undo_before": m["status"],
+            "undo_after": prev_status,
+            "was_confirmed_undo": was_confirmed_undo,
+            "siblings_restored": siblings_restored,
+            "prev_note": prev_note,
+        },
+    )
+
 
 def _review_single(batch_id, match_id, action, note):
     if action is None:
@@ -518,6 +578,19 @@ def _apply_review(batch_id, match_id, m, action, note):
     label = "确认" if action == "confirm" else "拒绝"
     click.echo(f"  匹配 #{match_id} 已{label}")
 
+    audit.log_audit(
+        action="review",
+        batch_id=batch_id,
+        match_id=match_id,
+        result="success",
+        detail={
+            "adjudication": adjudication,
+            "prev_status": prev_status,
+            "new_status": new_status,
+            "note": note,
+        },
+    )
+
 
 def _print_match(m):
     click.echo(f"--- 匹配 #{m['id']} [{m['status']}] 类型={m['match_type']} ---")
@@ -564,6 +637,15 @@ def revoke(batch):
 
     click.echo(f"批次 {batch} ({b.name}) 已撤销")
 
+    audit.log_audit(
+        action="revoke",
+        batch_id=batch,
+        batch_name=b.name,
+        rule_version=b.rule_version,
+        result="success",
+        detail={"prev_status": b.status},
+    )
+
 
 @cli.command("export", help=rules.EXPORT_RULES_HELP)
 @click.option("--batch", required=True, type=int, help="批次 ID")
@@ -609,6 +691,21 @@ def export_cmd(batch, output):
         skipped_rejected=skipped_rejected,
         skipped_clean=skipped_clean,
     ))
+
+    audit.log_audit(
+        action="export",
+        batch_id=batch,
+        batch_name=b.name,
+        rule_version=b.rule_version,
+        result="success",
+        detail={
+            "export_path": out_path,
+            "exported_count": len(diff_matches),
+            "total_count": len(all_matches),
+            "skipped_rejected": skipped_rejected,
+            "skipped_clean": skipped_clean,
+        },
+    )
 
 
 @cli.command("list")
@@ -699,6 +796,19 @@ def snapshot_create(batch, name):
     click.echo(f"  发票: {info['invoice_count']} | 付款: {info['payment_count']} | 匹配: {info['match_count']} | 裁决记录: {info['adjudication_count']}")
     click.echo(f"  文件: {info['file']}")
 
+    audit.log_audit(
+        action="snapshot-create",
+        batch_id=batch,
+        batch_name=b.name,
+        rule_version=b.rule_version,
+        result="success",
+        detail={
+            "snapshot_id": info["snapshot_id"],
+            "snapshot_name": info["snapshot_name"],
+            "file": info["file"],
+        },
+    )
+
 
 @snapshot_cmd.command("list", help=rules.SNAPSHOT_LIST_HELP)
 def snapshot_list():
@@ -766,6 +876,20 @@ def snapshot_restore(snapshot_ref, batch_name):
     click.echo(f"  状态: {result['status']} | 规则: {result['rule_version']}")
     click.echo(f"  发票: {result['invoice_count']} | 付款: {result['payment_count']} | 匹配: {result['match_count']} | 裁决记录: {result['adjudication_count']}")
 
+    audit.log_audit(
+        action="snapshot-restore",
+        batch_id=result["new_batch_id"],
+        batch_name=result["new_batch_name"],
+        rule_version=result["rule_version"],
+        result="success",
+        detail={
+            "snapshot_id": info.get("snapshot_id", ""),
+            "was_renamed": result["was_renamed"],
+            "original_name": result.get("original_name"),
+            "new_batch_id": result["new_batch_id"],
+        },
+    )
+
 
 # ======================================================================
 # 打包与验包命令组
@@ -811,6 +935,19 @@ def pack_cmd(batch, output, name, include_export, force):
     if m["includes_export"]:
         click.echo(f"  包含导出结果: 是")
     click.echo(f"  快照 ID: {info['snapshot_id']}")
+
+    audit.log_audit(
+        action="pack",
+        batch_id=batch,
+        batch_name=b.name,
+        rule_version=b.rule_version,
+        result="success",
+        detail={
+            "package_file": info["package_file"],
+            "snapshot_id": info["snapshot_id"],
+            "includes_export": info["manifest"]["includes_export"],
+        },
+    )
 
 
 @cli.command("unpack", help=rules.PACK_UNPACK_HELP)
@@ -886,6 +1023,24 @@ def unpack_cmd(input_file, batch_name, force, dry_run):
             click.echo(f"    #{r['match_id']} [{r['status']}] {r['match_type']} 发票:{inv} 付款:{pay}")
         if len(vr["pending"]) > 5:
             click.echo(f"    ... 还有 {len(vr['pending']) - 5} 条")
+
+    audit.log_audit(
+        action="unpack",
+        batch_id=result["new_batch_id"],
+        batch_name=result["new_batch_name"],
+        rule_version=result["rule_version"],
+        result="success",
+        detail={
+            "package_file": input_file,
+            "was_renamed": result["was_renamed"],
+            "original_name": result.get("original_name"),
+            "new_batch_id": result["new_batch_id"],
+            "snapshot_file": result["snapshot_file"],
+            "total_records": vr["total_records"],
+            "preserved_count": vr["preserved_count"],
+            "renamed_count": vr["renamed_count"],
+        },
+    )
 
 
 def _run_unpack_dry_run(input_file: str, batch_name: str, force: bool):
@@ -1049,6 +1204,168 @@ def inspect_cmd(input_file):
         click.echo("⚠  警告:")
         for w in result["warnings"]:
             click.echo(f"  - {w}")
+
+
+# ======================================================================
+# 审计与异常追踪命令组
+# ======================================================================
+
+@cli.group("audit", help=rules.AUDIT_RULES_HELP)
+def audit_cmd():
+    pass
+
+
+@audit_cmd.command("list", help=rules.AUDIT_LIST_HELP)
+@click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--operator", default=None, help="按操作者筛选")
+@click.option("--action", "action_type", default=None,
+              type=click.Choice(sorted(audit.VALID_ACTIONS)),
+              help="按动作类型筛选")
+@click.option("--result", default=None,
+              type=click.Choice(["success", "failure"]),
+              help="按结果筛选")
+@click.option("--from", "time_start", default=None,
+              help="起始时间（ISO 格式，如 2024-01-01 或 2024-01-01T00:00:00）")
+@click.option("--to", "time_end", default=None,
+              help="截止时间（ISO 格式）")
+@click.option("--limit", default=50, type=int, help="返回条数上限（默认 50）")
+def audit_list(batch, operator, action_type, result, time_start, time_end, limit):
+    records = audit.query_audit(
+        batch_id=batch,
+        operator=operator,
+        action=action_type,
+        result=result,
+        time_start=time_start,
+        time_end=time_end,
+        limit=limit,
+    )
+    if not records:
+        click.echo("无匹配的审计记录")
+        return
+
+    click.echo(
+        f"{'ID':>6}  {'时间':<20} {'动作':<16} {'操作者':<10} "
+        f"{'批次ID':>6} {'批次名':<20} {'匹配ID':>6} {'规则':<6} {'结果':<8}"
+    )
+    click.echo("-" * 110)
+    for r in records:
+        click.echo(
+            f"{r['id']:>6}  {r['timestamp'][:19]:<20} {r['action']:<16} "
+            f"{r.get('operator', ''):<10} "
+            f"{r.get('batch_id', '') or '':>6} "
+            f"{r.get('batch_name', '') or '':<20} "
+            f"{r.get('match_id', '') or '':>6} "
+            f"{r.get('rule_version', '') or '':<6} "
+            f"{r['result']:<8}"
+        )
+
+
+@audit_cmd.command("show", help=rules.AUDIT_SHOW_HELP)
+@click.argument("record_id", type=int)
+def audit_show(record_id):
+    record = audit.get_audit_record(record_id)
+    if record is None:
+        click.echo(f"错误: 审计记录 {record_id} 不存在", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"审计记录 #{record['id']}")
+    click.echo(f"  时间: {record['timestamp']}")
+    click.echo(f"  动作: {record['action']}")
+    click.echo(f"  操作者: {record.get('operator', 'system')}")
+    click.echo(f"  结果: {record['result']}")
+
+    if record.get("batch_id"):
+        click.echo(f"  批次 ID: {record['batch_id']}")
+    if record.get("batch_name"):
+        click.echo(f"  批次名称: {record['batch_name']}")
+    if record.get("match_id"):
+        click.echo(f"  匹配 ID: {record['match_id']}")
+    if record.get("rule_version"):
+        click.echo(f"  规则版本: {record['rule_version']}")
+    if record.get("error_message"):
+        click.echo(f"  错误信息: {record['error_message']}")
+
+    detail = record.get("detail")
+    if detail:
+        click.echo()
+        click.echo("--- 详情 ---")
+        if isinstance(detail, dict):
+            for k, v in detail.items():
+                if v is not None:
+                    click.echo(f"  {k}: {v}")
+        else:
+            click.echo(f"  {detail}")
+
+
+@audit_cmd.command("export", help=rules.AUDIT_EXPORT_HELP)
+@click.option("--output", required=True, type=click.Path(),
+              help="输出文件路径")
+@click.option("--format", "fmt", type=click.Choice(["csv", "json"]),
+              default="csv", help="导出格式（默认 csv）")
+@click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--operator", default=None, help="按操作者筛选")
+@click.option("--action", "action_type", default=None,
+              type=click.Choice(sorted(audit.VALID_ACTIONS)),
+              help="按动作类型筛选")
+@click.option("--result", default=None,
+              type=click.Choice(["success", "failure"]),
+              help="按结果筛选")
+@click.option("--from", "time_start", default=None,
+              help="起始时间（ISO 格式）")
+@click.option("--to", "time_end", default=None,
+              help="截止时间（ISO 格式）")
+def audit_export(output, fmt, batch, operator, action_type, result, time_start, time_end):
+    try:
+        out_path = audit.export_audit_report(
+            output_path=output,
+            fmt=fmt,
+            batch_id=batch,
+            operator=operator,
+            action=action_type,
+            result=result,
+            time_start=time_start,
+            time_end=time_end,
+        )
+    except FileExistsError:
+        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_FILE_EXISTS}: {output}", err=True)
+        raise SystemExit(1)
+    except FileNotFoundError as e:
+        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_DIR_NOT_FOUND}: {e}", err=True)
+        raise SystemExit(1)
+    except PermissionError as e:
+        click.echo(f"错误: {rules.AUDIT_ERR_EXPORT_DIR_NOT_WRITABLE}: {e}", err=True)
+        raise SystemExit(1)
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.AUDIT_OK_EXPORTED}: {out_path}")
+
+
+@audit_cmd.command("config", help=rules.AUDIT_CONFIG_HELP)
+@click.option("--retention-days", type=int, default=None,
+              help="审计记录保留天数（0 表示永久保留）")
+@click.option("--verbose/--no-verbose", default=None,
+              help="是否记录详细字段")
+def audit_config_cmd(retention_days, verbose):
+    if retention_days is None and verbose is None:
+        config = audit.get_audit_config()
+        click.echo(f"{rules.AUDIT_CONFIG_RETENTION_DAYS_LABEL}: {config['retention_days']}")
+        click.echo(f"{rules.AUDIT_CONFIG_VERBOSE_LABEL}: {'是' if config['verbose'] else '否'}")
+        return
+
+    try:
+        config = audit.set_audit_config(
+            retention_days=retention_days,
+            verbose=verbose,
+        )
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.AUDIT_CONFIG_SAVED)
+    click.echo(f"  {rules.AUDIT_CONFIG_RETENTION_DAYS_LABEL}: {config['retention_days']}")
+    click.echo(f"  {rules.AUDIT_CONFIG_VERBOSE_LABEL}: {'是' if config['verbose'] else '否'}")
 
 
 # ======================================================================
