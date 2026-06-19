@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export, rules, snapshot
+from . import db, validators, matcher, export, rules, snapshot, pack
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -704,6 +704,195 @@ def snapshot_restore(snapshot_ref, batch_name):
 
 
 # ======================================================================
+# 打包与验包命令组
+# ======================================================================
+
+@cli.command("pack", help=rules.PACK_CREATE_HELP)
+@click.option("--batch", required=True, type=int, help="批次 ID")
+@click.option("--output", type=click.Path(), default=None,
+              help="输出包文件路径（默认自动生成）")
+@click.option("--name", default=None, help="包名称（默认基于批次名）")
+@click.option("--include-export/--no-include-export", default=True,
+              help="是否包含待导出结果（默认包含）")
+@click.option("--force", is_flag=True, default=False,
+              help="输出文件已存在时强制覆盖")
+def pack_cmd(batch, output, name, include_export, force):
+    b = db.get_batch(batch)
+    if b is None:
+        click.echo(f"错误: 批次 {batch} 不存在", err=True)
+        raise SystemExit(1)
+
+    try:
+        info = pack.pack_batch(
+            batch_id=batch,
+            output_path=output,
+            package_name=name,
+            include_export=include_export,
+            force=force,
+        )
+    except FileExistsError as e:
+        click.echo(f"错误: {e}", err=True)
+        click.echo(rules.PACK_FORCE_HINT, err=True)
+        raise SystemExit(1)
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.PACK_OK_PACKED)
+    click.echo(f"  包文件: {info['package_file']}")
+    m = info["manifest"]
+    click.echo(f"  源批次: #{m['source_batch_id']} {m['source_batch_name']}")
+    click.echo(f"  批次状态: {m['batch_status']} | 规则: {m['rule_version']}")
+    click.echo(f"  发票: {m['record_counts']['invoices']} | 付款: {m['record_counts']['payments']} | 匹配: {m['record_counts']['matches']} | 裁决: {m['record_counts']['adjudications']}")
+    if m["includes_export"]:
+        click.echo(f"  包含导出结果: 是")
+    click.echo(f"  快照 ID: {info['snapshot_id']}")
+
+
+@cli.command("unpack", help=rules.PACK_UNPACK_HELP)
+@click.option("--input", "input_file", required=True, type=click.Path(),
+              help="可搬运包文件路径")
+@click.option("--batch-name", default=None, help="新批次名称（默认使用包内批次名）")
+@click.option("--force", is_flag=True, default=False,
+              help="同名快照文件已存在时强制覆盖")
+def unpack_cmd(input_file, batch_name, force):
+    if not os.path.exists(input_file):
+        click.echo(f"错误: 包文件不存在: {input_file}", err=True)
+        raise SystemExit(1)
+    try:
+        result = pack.unpack_package(
+            package_path=input_file,
+            batch_name=batch_name,
+            force=force,
+        )
+    except FileExistsError as e:
+        click.echo(f"错误: {e}", err=True)
+        click.echo(rules.PACK_FORCE_HINT, err=True)
+        raise SystemExit(1)
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.PACK_OK_UNPACKED)
+    click.echo(f"  新批次 ID: {result['new_batch_id']}")
+    click.echo(f"  新批次名称: {result['new_batch_name']}")
+    if result["was_renamed"]:
+        click.echo(rules.PACK_RENAMED_HINT)
+        click.echo(f"  原名称: {result['original_name']}")
+    click.echo(f"  状态: {result['batch_status']} | 规则: {result['rule_version']}")
+    click.echo(f"  快照文件: {result['snapshot_file']}")
+    if result["export_saved_as"]:
+        click.echo(f"  导出结果已保存为: {result['export_saved_as']}")
+
+    vr = result["validation_report"]
+    click.echo()
+    click.echo("--- 导入后校验报告 ---")
+    click.echo(f"  总记录数: {vr['total_records']}")
+    click.echo(f"  {rules.PACK_PRESERVED_PREFIX} {vr['preserved_count']} 条（已裁决，状态不变）")
+    if vr["preserved"]:
+        for r in vr["preserved"][:5]:
+            status_label = "✓ 确认" if r["status"] == "confirmed" else "✗ 拒绝"
+            inv = r["invoice_no"] or "-"
+            pay = r["payment_no"] or "-"
+            click.echo(f"    #{r['match_id']} [{status_label}] {r['match_type']} 发票:{inv} 付款:{pay}")
+        if len(vr["preserved"]) > 5:
+            click.echo(f"    ... 还有 {len(vr['preserved']) - 5} 条")
+    click.echo(f"  {rules.PACK_PENDING_PREFIX} {vr['renamed_count']} 条（ID 已重分配，待复核）")
+    if vr["pending"]:
+        for r in vr["pending"][:5]:
+            inv = r["invoice_no"] or "-"
+            pay = r["payment_no"] or "-"
+            click.echo(f"    #{r['match_id']} [{r['status']}] {r['match_type']} 发票:{inv} 付款:{pay}")
+        if len(vr["pending"]) > 5:
+            click.echo(f"    ... 还有 {len(vr['pending']) - 5} 条")
+
+    if result["warnings"]:
+        click.echo()
+        click.echo("⚠  警告:")
+        for w in result["warnings"]:
+            click.echo(f"  - {w}")
+
+
+@cli.command("verify", help=rules.PACK_VERIFY_HELP)
+@click.option("--input", "input_file", required=True, type=click.Path(),
+              help="可搬运包文件路径")
+def verify_cmd(input_file):
+    if not os.path.exists(input_file):
+        click.echo(f"错误: 包文件不存在: {input_file}", err=True)
+        raise SystemExit(1)
+    result = pack.verify_package(input_file)
+
+    if result["valid"]:
+        click.echo(rules.PACK_OK_VERIFIED)
+        m = result["manifest"]
+        if m:
+            click.echo(f"  源批次: #{m['source_batch_id']} {m['source_batch_name']}")
+            click.echo(f"  批次状态: {m['batch_status']} | 规则: {m['rule_version']}")
+            click.echo(f"  打包时间: {m['created_at']}")
+            click.echo(f"  工具版本: {m['tool_version']}")
+            if m.get("source_machine"):
+                click.echo(f"  源机器: {m['source_machine']}")
+            click.echo(f"  发票: {m['record_counts']['invoices']} | 付款: {m['record_counts']['payments']} | 匹配: {m['record_counts']['matches']} | 裁决: {m['record_counts']['adjudications']}")
+            if m["includes_export"]:
+                click.echo(f"  包含导出结果: 是")
+        if result["warnings"]:
+            click.echo()
+            click.echo("⚠  警告:")
+            for w in result["warnings"]:
+                click.echo(f"  - {w}")
+    else:
+        click.echo("包校验失败:", err=True)
+        for e in result["errors"]:
+            click.echo(f"  ✗ {e}", err=True)
+        raise SystemExit(1)
+
+
+@cli.command("inspect", help=rules.PACK_INSPECT_HELP)
+@click.option("--input", "input_file", required=True, type=click.Path(),
+              help="可搬运包文件路径")
+def inspect_cmd(input_file):
+    if not os.path.exists(input_file):
+        click.echo(f"错误: 包文件不存在: {input_file}", err=True)
+        raise SystemExit(1)
+    result = pack.inspect_package(input_file)
+
+    if not result["valid"]:
+        click.echo("包无效:", err=True)
+        for e in result["errors"]:
+            click.echo(f"  ✗ {e}", err=True)
+        raise SystemExit(1)
+
+    si = result["snapshot_info"]
+    click.echo(f"包文件: {result['package_file']}")
+    click.echo(f"包大小: {result['package_size']} 字节")
+    click.echo()
+    click.echo("--- 快照信息 ---")
+    click.echo(f"  快照 ID: {si['snapshot_id']}")
+    click.echo(f"  快照名称: {si['snapshot_name']}")
+    click.echo(f"  源批次: #{si['source_batch_id']} {si['source_batch_name']}")
+    click.echo(f"  批次状态: {si['batch_status']}")
+    click.echo(f"  规则版本: {si['rule_version']}")
+    click.echo(f"  发票: {si['invoice_count']} 条")
+    click.echo(f"  付款: {si['payment_count']} 条")
+    click.echo(f"  匹配: {si['match_count']} 条")
+    click.echo(f"  裁决历史: {si['adjudication_count']} 条")
+    click.echo()
+    click.echo("--- 打包元数据 ---")
+    m = result["manifest"]
+    click.echo(f"  打包时间: {m['created_at']}")
+    click.echo(f"  工具版本: {m['tool_version']}")
+    if m.get("source_machine"):
+        click.echo(f"  源机器: {m['source_machine']}")
+    click.echo(f"  包含导出结果: {'是' if m['includes_export'] else '否'}")
+
+    if result["warnings"]:
+        click.echo()
+        click.echo("⚠  警告:")
+        for w in result["warnings"]:
+            click.echo(f"  - {w}")
+
+
+# ======================================================================
 # 统一为命令函数设置 __doc__ —— 让 --help 显示 rules 模块的共享文案。
 # 必须放在所有命令定义之后（否则函数还不存在）。
 # 这样做可以保证 README / --help / 实际提示使用同一份文案源。
@@ -713,3 +902,7 @@ export_cmd.__doc__ = rules.EXPORT_RULES_HELP
 review_undo.__doc__ = rules.REVIEW_UNDO_RULES_HELP
 snapshot_create.__doc__ = rules.SNAPSHOT_CREATE_HELP
 snapshot_restore.__doc__ = rules.SNAPSHOT_RESTORE_HELP
+pack_cmd.__doc__ = rules.PACK_CREATE_HELP
+unpack_cmd.__doc__ = rules.PACK_UNPACK_HELP
+verify_cmd.__doc__ = rules.PACK_VERIFY_HELP
+inspect_cmd.__doc__ = rules.PACK_INSPECT_HELP

@@ -225,7 +225,7 @@ inv-recon show --batch BATCH_ID
 
 ## 批次快照与恢复
 
-快照可保存某个批次的完整状态（规则版本、匹配结果、人工裁决、备注、裁决历史），换终端或重启后可恢复继续复核或重新导出。默认快照目录为 \./snapshots/\，可通过环境变量 \INV_RECON_SNAPSHOT_DIR\ 指定。
+快照可保存某个批次的完整状态（规则版本、匹配结果、人工裁决、备注、裁决历史），换终端或重启后可恢复继续复核或重新导出。默认快照目录为 `./snapshots/`，可通过环境变量 `INV_RECON_SNAPSHOT_DIR` 指定。
 
 ### \inv-recon snapshot create
 \inv-recon snapshot create --batch BATCH_ID [--name NAME]
@@ -243,7 +243,8 @@ inv-recon show --batch BATCH_ID
 - 匹配结果和裁决备注
 - 完整裁决历史（状态链路不丢失）
 
-### \inv-recon snapshot list
+### `inv-recon snapshot list`
+
 列出所有快照，按创建时间倒序。
 
 ### \inv-recon snapshot show
@@ -255,21 +256,105 @@ inv-recon show --batch BATCH_ID
 
 显示指定快照的详情。
 
-### \inv-recon snapshot restore
-\inv-recon snapshot restore --snapshot SNAPSHOT_REF [--batch-name NAME]
-\
+### `inv-recon snapshot restore`
+
+```
+inv-recon snapshot restore --snapshot ID_OR_NAME [--batch-name NEW_NAME]
+```
+
 | 参数 | 必填 | 说明 |
 |------|------|------|
-| \--snapshot\ | 是 | 快照 ID（完整或前缀）或快照名称 |
-| \--batch-name\ | 否 | 新批次名称（默认使用快照内的批次名） |
+| `--snapshot` | 是 | 快照 ID（完整或前缀）或快照名称 |
+| `--batch-name` | 否 | 新批次名称（默认使用快照内的批次名） |
 
 将快照恢复为新批次：
 - 总是作为**全新批次**导入，**绝不覆盖**现有批次数据；
 - 所有 ID 重新分配，裁决历史完整保留，状态链路不丢失；
-- 同名批次自动重命名（添加 \_2\、\_3\ 后缀）；
+- 同名批次自动重命名（添加 `_2`、`_3` 后缀）；
 - 快照对应的规则版本如库里不存在则自动创建；
-- 已撤销 (evoked\) 的批次快照，恢复后保持 evoked\ 状态；
-- 恢复后可继续 eview\ / eview-undo\ / \xport\。
+- 已撤销 (`revoked`) 的批次快照，恢复后保持 `revoked` 状态；
+- 恢复后可继续 `review` / `review-undo` / `export`。
+
+## 快照打包与跨机器搬运
+
+将批次连同规则版本、人工裁决备注、待导出结果和必要元数据打成可搬运包 (`.invpkg`)，在另一台机器或新目录里导入后继续 `list`/`show`/`review`/`export`。
+
+### `inv-recon pack`
+
+```
+inv-recon pack --batch BATCH_ID [--output FILE] [--name NAME] [--include-export / --no-include-export] [--force]
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--batch` | 是 | 批次 ID |
+| `--output` | 否 | 输出包文件路径（默认自动生成） |
+| `--name` | 否 | 包名称（默认基于批次名） |
+| `--include-export / --no-include-export` | 否 | 是否包含待导出结果（默认包含） |
+| `--force` | 否 | 输出文件已存在时强制覆盖 |
+
+将指定批次打包为 `.invpkg` 可搬运包。任意状态的批次都可打包。
+
+**包内包含：**
+- `manifest.json` — 元数据（打包时间、工具版本、源机器、记录数等）
+- `snapshot.json` — 完整快照（批次+规则+发票+付款+匹配+裁决历史）
+- `checksums.json` — 各文件 SHA256 校验和
+- `export.csv` — 可选，待导出结果（reviewed/exported 状态时自动包含）
+
+### `inv-recon unpack`
+
+```
+inv-recon unpack --input FILE [--batch-name NEW_NAME] [--force]
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--input` | 是 | 可搬运包文件路径 |
+| `--batch-name` | 否 | 新批次名称（默认使用包内批次名） |
+| `--force` | 否 | 同名快照文件已存在时强制覆盖 |
+
+导入可搬运包，恢复为新批次：
+
+**导入前校验：**
+1. 校验包完整性（必需文件存在、校验和匹配、格式正确）；
+2. 若不完整则拒绝导入并列出问题；
+3. 快照目录不存在则自动创建。
+
+**冲突处理：**
+- 同名批次：自动在名称后加 `_2`、`_3` 后缀；
+- 同名快照文件：报错，需 `--force` 覆盖；
+- 绝不覆盖现有批次数据（始终作为新批次导入）。
+
+**导入后校验报告：**
+- 显示哪些裁决记录沿用了原状态（confirmed/rejected）；
+- 显示哪些记录被重命名（ID 重新分配）；
+- 显示规则版本是否需要自动创建。
+
+导入后可继续 `list`/`show`/`review`/`review-undo`/`export`。
+
+### `inv-recon verify`
+
+```
+inv-recon verify --input FILE
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--input` | 是 | 可搬运包文件路径 |
+
+校验可搬运包的完整性和有效性（不导入）。检查：必需文件、校验和、格式、schema 版本兼容性。
+
+### `inv-recon inspect`
+
+```
+inv-recon inspect --input FILE
+```
+
+| 参数 | 必填 | 说明 |
+|------|------|------|
+| `--input` | 是 | 可搬运包文件路径 |
+
+查看包的元信息（不导入数据库）。显示：批次名、状态、规则版本、记录数、打包时间、源机器等。
 
 ## 错误处理
 
@@ -286,6 +371,11 @@ inv-recon show --batch BATCH_ID
 | review-undo 撤销裁决 | 合法范围内撤销，相关联 auto_rejected 也恢复；其他记录不变 |
 | 快照创建 | 完整保存批次+规则+匹配+裁决历史；不影响现有批次和数据库 |
 | 快照恢复 | 作为全新批次导入，绝不覆盖现有数据；同名自动重命名；裁决历史完整保留 |
+| 打包输出文件已存在 | 报错不覆盖；需 --force 才覆盖；保护已有包文件 |
+| 导入同名批次 | 自动重命名加 _2/_3 后缀；绝不覆盖现有批次数据 |
+| 导入包内容不完整/损坏 | 导入前校验，不完整则拒绝导入并列出问题；数据库不受影响 |
+| 导入快照目录缺失 | 自动创建快照目录；不报错 |
+| 导入包校验和不匹配 | 拒绝导入；保护数据完整性优先 |
 
 ## 持久性
 
