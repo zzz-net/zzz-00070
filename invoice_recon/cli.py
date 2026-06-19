@@ -42,10 +42,13 @@ def import_data(invoices, payments, name, dry_run):
     # 真实导入：复用同一套校验逻辑（先跑一遍 plan，确保校验一致）
     plan_result = plan.plan_import(invoices, payments, name)
     if not plan_result.success:
+        click.echo(f"{rules.PLAN_REAL_IMPORT_FAILED}", err=True)
         click.echo(f"{rules.PLAN_SECTION_ERRORS}:", err=True)
         for e in plan_result.errors:
             click.echo(f"  ✗ {e}", err=True)
         raise SystemExit(1)
+
+    click.echo(rules.PLAN_REAL_IMPORT_PASSED)
 
     rule = db.get_current_rule()
     final_name = plan_result.batch_name
@@ -122,13 +125,33 @@ def _run_import_dry_run(invoices: str, payments: str, name: str):
         click.echo(f"         ({result.bad_payment_count} 行坏数据将被跳过)")
     click.echo()
 
+    click.echo(rules.PLAN_SECTION_FS_CHECK)
+    if result.db_path_resolved:
+        click.echo(f"{rules.PLAN_FS_DB_PATH}: {result.db_path_resolved}")
+    if result.writable_ok:
+        click.echo(rules.PLAN_FS_CHECK_OK)
+    else:
+        click.echo(rules.PLAN_FS_CHECK_FAILED)
+        for e in result.writable_errors:
+            click.echo(f"    ✗ {e}")
+    if result.files_to_create:
+        click.echo(f"{rules.PLAN_FS_FILES_TO_CREATE}:")
+        for f in result.files_to_create:
+            click.echo(f"    - {f}")
+    if result.dirs_to_create:
+        click.echo(f"{rules.PLAN_FS_DIRS_TO_CREATE}:")
+        for d in result.dirs_to_create:
+            click.echo(f"    - {d}")
+    click.echo()
+
     if result.warnings:
         click.echo(f"{rules.PLAN_SECTION_WARNINGS}:")
         for w in result.warnings:
             click.echo(f"  ⚠  {w}")
         click.echo()
 
-    click.echo(rules.PLAN_HINT_REAL_IMPORT)
+    click.echo(rules.PLAN_PREVIEW_COMMAND_INTRO)
+    click.echo(rules.PLAN_PREVIEW_EXAMPLE_IMPORT)
 
 
 @cli.command()
@@ -810,9 +833,12 @@ def unpack_cmd(input_file, batch_name, force, dry_run):
     # 真实导入：复用同一套校验逻辑（先跑一遍 plan，确保校验一致）
     plan_result = plan.plan_unpack(input_file, batch_name, force)
     if not plan_result.success:
+        click.echo(f"{rules.PLAN_REAL_IMPORT_FAILED}", err=True)
         error_msg = ";\n".join(plan_result.errors)
         click.echo(f"错误: 包校验失败: {error_msg}", err=True)
         raise SystemExit(1)
+
+    click.echo(rules.PLAN_REAL_IMPORT_PASSED)
 
     try:
         result = pack.unpack_package(
@@ -903,13 +929,47 @@ def _run_unpack_dry_run(input_file: str, batch_name: str, force: bool):
         click.echo(f"  导出结果: {result.export_file}")
     click.echo()
 
+    click.echo(rules.PLAN_SECTION_FS_CHECK)
+    if result.db_path_resolved:
+        click.echo(f"{rules.PLAN_FS_DB_PATH}: {result.db_path_resolved}")
+    if result.snapshot_dir:
+        click.echo(f"{rules.PLAN_FS_SNAPSHOT_DIR}: {result.snapshot_dir}")
+    if result.unpack_tmp_dir:
+        click.echo(f"{rules.PLAN_FS_TMP_DIR}: {result.unpack_tmp_dir}")
+    if result.writable_ok:
+        click.echo(rules.PLAN_FS_CHECK_OK)
+    else:
+        click.echo(rules.PLAN_FS_CHECK_FAILED)
+        for e in result.writable_errors:
+            click.echo(f"    ✗ {e}")
+    if result.files_to_create:
+        click.echo(f"{rules.PLAN_FS_FILES_TO_CREATE}:")
+        for f in result.files_to_create:
+            click.echo(f"    - {f}")
+    if result.dirs_to_create:
+        click.echo(f"{rules.PLAN_FS_DIRS_TO_CREATE}:")
+        for d in result.dirs_to_create:
+            click.echo(f"    - {d}")
+    click.echo()
+
+    if result.conflict_details:
+        click.echo(rules.PLAN_SECTION_CONFLICTS)
+        for c in result.conflict_details:
+            click.echo(f"  ✗ {c}")
+        click.echo()
+    else:
+        click.echo(rules.PLAN_SECTION_CONFLICTS)
+        click.echo(rules.PLAN_CONFLICT_NONE)
+        click.echo()
+
     if result.warnings:
         click.echo(f"{rules.PLAN_SECTION_WARNINGS}:")
         for w in result.warnings:
             click.echo(f"  ⚠  {w}")
         click.echo()
 
-    click.echo(rules.PLAN_HINT_REAL_IMPORT)
+    click.echo(rules.PLAN_PREVIEW_COMMAND_INTRO)
+    click.echo(rules.PLAN_PREVIEW_EXAMPLE_UNPACK)
 
 
 @cli.command("verify", help=rules.PACK_VERIFY_HELP)

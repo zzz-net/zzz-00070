@@ -59,22 +59,30 @@ PLAN_RULES_HELP = (
     "  - 规则版本\n"
     "  - 记录数量（发票/付款/匹配/裁决/坏行）\n"
     "  - 可能的名称冲突\n"
-    "  - 快照或导出文件会落到哪里\n\n"
+    "  - 快照或导出文件会落到哪里\n"
+    "  - 数据库/快照目录/临时目录的可写性检查\n"
+    "  - 将要落盘的文件和目录清单\n\n"
     "【真实导入复用同一套校验逻辑】\n"
     "  预检通过的内容，真实导入时使用完全相同的校验逻辑，\n"
-    "  避免预检通过但落库失败的情况。"
+    "  避免预检通过但落库失败的情况。\n\n"
+    "【预检失败 = 不会写入任何数据】\n"
+    "  目录不可写、数据库被占用等文件系统问题\n"
+    "  会在预检阶段就报错，不会半路炸掉。"
 )
 
 PLAN_IMPORT_HELP = (
     "预检 CSV 导入会产生什么变化（dry-run 模式，不写数据库）。\n\n"
     "使用 --dry-run 或 --plan 参数启用预检模式。\n"
-    "预检不改数据库、不生成快照、不留半截文件。"
+    "预检不改数据库、不生成快照、不留半截文件。\n\n"
+    "预检内容包括：数据格式、同名冲突、数据库可写性、落盘路径。"
 )
 
 PLAN_UNPACK_HELP = (
     "预检可搬运包导入会产生什么变化（dry-run 模式，不写数据库）。\n\n"
     "使用 --dry-run 或 --plan 参数启用预检模式。\n"
-    "预检不改数据库、不生成快照、不留半截文件。"
+    "预检不改数据库、不生成快照、不留半截文件。\n\n"
+    "预检内容包括：包完整性、同名冲突、快照目录/数据库/临时目录可写性、\n"
+    "快照文件和导出文件的落盘位置与冲突检测。"
 )
 
 PLAN_DRY_RUN_OPTION_HELP = "启用预检模式（只预览，不写入数据库/快照）"
@@ -85,10 +93,37 @@ PLAN_REAL_MODE_LABEL = "✅ 已写入"
 PLAN_SECTION_BATCH = "--- 批次信息 ---"
 PLAN_SECTION_RECORDS = "--- 记录统计 ---"
 PLAN_SECTION_FILES = "--- 文件位置 ---"
+PLAN_SECTION_FS_CHECK = "--- 文件系统预检 ---"
+PLAN_SECTION_CONFLICTS = "--- 冲突检测 ---"
 PLAN_SECTION_WARNINGS = "⚠  注意事项"
 PLAN_SECTION_ERRORS = "✗ 错误"
 
 PLAN_HINT_REAL_IMPORT = "  提示：去掉 --dry-run 参数即可执行真实导入"
+
+PLAN_FS_CHECK_OK = "✔ 可写性检查通过"
+PLAN_FS_CHECK_FAILED = "✗ 可写性检查失败"
+PLAN_FS_DB_PATH = "  数据库路径"
+PLAN_FS_SNAPSHOT_DIR = "  快照目录"
+PLAN_FS_TMP_DIR = "  临时目录"
+PLAN_FS_FILES_TO_CREATE = "  将新建文件"
+PLAN_FS_DIRS_TO_CREATE = "  将新建目录"
+PLAN_FS_WRITABLE_ERRORS = "  不可写位置"
+
+PLAN_CONFLICT_NONE = "✔ 无文件冲突"
+PLAN_CONFLICT_FOUND = "✗ 检测到文件冲突"
+
+PLAN_PREVIEW_COMMAND_INTRO = (
+    "  可复制命令：去掉 --dry-run / --plan 参数即可执行真实导入"
+)
+PLAN_PREVIEW_EXAMPLE_IMPORT = (
+    "    inv-recon import --invoices <FILE> --payments <FILE> --name <NAME>"
+)
+PLAN_PREVIEW_EXAMPLE_UNPACK = (
+    "    inv-recon unpack --input <FILE> [--batch-name <NAME>] [--force]"
+)
+
+PLAN_REAL_IMPORT_PASSED = "  预检已通过，开始写入"
+PLAN_REAL_IMPORT_FAILED = "  预检未通过，终止导入"
 
 
 # ---------------------------------------------------------------------------
