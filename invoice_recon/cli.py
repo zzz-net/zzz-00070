@@ -7,7 +7,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
 if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from . import db, validators, matcher, export, rules, snapshot, pack, plan, audit
+from . import db, validators, matcher, export, rules, snapshot, pack, plan, audit, replay
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -23,6 +23,7 @@ def init():
     """初始化数据库（创建表结构和默认规则 v1）"""
     db.init_db()
     audit.init_audit_db()
+    replay.init_replay_db()
     click.echo("数据库已初始化，默认规则版本 v1（容差 0.01，需供应商匹配）")
 
 
@@ -1476,6 +1477,322 @@ def audit_config_cmd(retention_days, verbose):
     click.echo(rules.AUDIT_CONFIG_SAVED)
     click.echo(f"  {rules.AUDIT_CONFIG_RETENTION_DAYS_LABEL}: {config['retention_days']}")
     click.echo(f"  {rules.AUDIT_CONFIG_VERBOSE_LABEL}: {'是' if config['verbose'] else '否'}")
+
+
+# ======================================================================
+# 任务回放与证据包命令组
+# ======================================================================
+
+@cli.group("replay", help=rules.REPLAY_RULES_HELP)
+def replay_cmd():
+    """任务回放与证据包命令组。"""
+    pass
+
+
+@replay_cmd.command("start", help=rules.REPLAY_START_HELP)
+@click.option("--name", required=True, help="回放会话名称")
+@click.option("--description", default=None, help="会话描述")
+@click.option("--operator", default="system", help="操作者（默认 system）")
+@click.option("--batch", type=int, default=None, help="关联批次 ID")
+@click.option("--input", "input_json", default=None,
+              help="输入摘要 JSON 字符串（可选）")
+def replay_start(name, description, operator, batch, input_json):
+    input_summary = None
+    if input_json:
+        try:
+            import json
+            input_summary = json.loads(input_json)
+        except json.JSONDecodeError as e:
+            click.echo(f"错误: --input JSON 格式错误: {e}", err=True)
+            raise SystemExit(1)
+
+    try:
+        session = replay.start_replay_session(
+            name=name,
+            description=description,
+            operator=operator,
+            batch_id=batch,
+            input_summary=input_summary,
+        )
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.REPLAY_OK_STARTED)
+    click.echo(f"  会话 ID: {session['id']}")
+    click.echo(f"  会话 Key: {session['session_key']}")
+    click.echo(f"  名称: {session['name']}")
+    if session.get("description"):
+        click.echo(f"  描述: {session['description']}")
+    click.echo(f"  操作者: {session['operator']}")
+    click.echo(f"  开始时间: {session['start_time']}")
+
+
+@replay_cmd.command("list", help=rules.REPLAY_LIST_HELP)
+@click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--batch-name", default=None, help="按批次名称模糊筛选")
+@click.option("--operator", default=None, help="按操作者筛选")
+@click.option("--result", default=None,
+              type=click.Choice(sorted(replay.VALID_SESSION_RESULTS)),
+              help="按结果筛选")
+@click.option("--action", default=None, help="按包含的步骤动作筛选")
+@click.option("--from", "time_start", default=None,
+              help="起始时间（ISO 格式）")
+@click.option("--to", "time_end", default=None,
+              help="截止时间（ISO 格式）")
+@click.option("--limit", default=50, type=int, help="返回条数上限（默认 50）")
+def replay_list(batch, batch_name, operator, result, action,
+                time_start, time_end, limit):
+    sessions = replay.list_replay_sessions(
+        batch_id=batch,
+        batch_name=batch_name,
+        operator=operator,
+        result=result,
+        action=action,
+        time_start=time_start,
+        time_end=time_end,
+        limit=limit,
+    )
+    if not sessions:
+        click.echo("无匹配的回放会话")
+        return
+
+    click.echo(
+        f"{'ID':>6}  {'Key':<22} {'名称':<20} {'操作者':<10} "
+        f"{'批次ID':>6} {'结果':<10} {'步骤':>4} {'开始时间':<20}"
+    )
+    click.echo("-" * 110)
+    for s in sessions:
+        steps = replay.get_replay_steps(s["id"])
+        click.echo(
+            f"{s['id']:>6}  {s['session_key']:<22} {s['name']:<20} "
+            f"{s.get('operator', ''):<10} "
+            f"{s.get('batch_id', '') or '':>6} "
+            f"{s['result']:<10} {len(steps):>4} "
+            f"{s['start_time'][:19]:<20}"
+        )
+
+
+@replay_cmd.command("show", help=rules.REPLAY_SHOW_HELP)
+@click.argument("session_id", type=int)
+def replay_show(session_id):
+    session = replay.get_replay_session(session_id)
+    if session is None:
+        click.echo(f"错误: 回放会话 {session_id} 不存在", err=True)
+        raise SystemExit(1)
+
+    steps = replay.get_replay_steps(session_id)
+
+    click.echo(f"回放会话 #{session['id']}")
+    click.echo(f"  Key: {session['session_key']}")
+    click.echo(f"  名称: {session['name']}")
+    if session.get("description"):
+        click.echo(f"  描述: {session['description']}")
+    click.echo(f"  操作者: {session.get('operator', 'system')}")
+    click.echo(f"  结果: {session['result']}")
+    click.echo(f"  开始时间: {session['start_time']}")
+    if session.get("end_time"):
+        click.echo(f"  结束时间: {session['end_time']}")
+    if session.get("batch_id"):
+        click.echo(f"  批次 ID: {session['batch_id']}")
+    if session.get("batch_name"):
+        click.echo(f"  批次名称: {session['batch_name']}")
+    if session.get("undo_time"):
+        click.echo(f"  撤销时间: {session['undo_time']}")
+        if session.get("undo_note"):
+            click.echo(f"  撤销备注: {session['undo_note']}")
+    if session.get("error_message"):
+        click.echo(f"  错误信息: {session['error_message']}")
+
+    config_snap = session.get("config_snapshot")
+    if config_snap:
+        click.echo()
+        click.echo("--- 配置快照 ---")
+        if isinstance(config_snap, dict):
+            for k, v in config_snap.items():
+                click.echo(f"  {k}: {v}")
+
+    input_snap = session.get("input_summary")
+    if input_snap:
+        click.echo()
+        click.echo("--- 输入摘要 ---")
+        if isinstance(input_snap, dict):
+            for k, v in input_snap.items():
+                click.echo(f"  {k}: {v}")
+        else:
+            click.echo(f"  {input_snap}")
+
+    if steps:
+        click.echo()
+        click.echo("--- 步骤 ---")
+        for st in steps:
+            status_icon = "✓" if st["result"] == "success" else "✗"
+            click.echo(
+                f"  #{st['step_index']} [{st['result']}] {st['action']}"
+                f" — {st.get('description', '')}"
+            )
+            if st.get("detail"):
+                detail = st["detail"]
+                if isinstance(detail, dict):
+                    for k, v in detail.items():
+                        click.echo(f"      {k}: {v}")
+                else:
+                    click.echo(f"      {detail}")
+            if st.get("error_message"):
+                click.echo(f"      错误: {st['error_message']}")
+
+
+@replay_cmd.command("export", help=rules.REPLAY_EXPORT_HELP)
+@click.option("--output", required=True, type=click.Path(),
+              help="输出文件路径")
+@click.option("--format", "fmt", type=click.Choice(["json", "csv", "zip"]),
+              default="json", help="导出格式（默认 json）")
+@click.option("--session", "session_ids", multiple=True, type=int,
+              help="指定会话 ID（可多次指定）")
+@click.option("--batch", type=int, default=None, help="按批次 ID 筛选")
+@click.option("--batch-name", default=None, help="按批次名称模糊筛选")
+@click.option("--operator", default=None, help="按操作者筛选")
+@click.option("--result", default=None,
+              type=click.Choice(sorted(replay.VALID_SESSION_RESULTS)),
+              help="按结果筛选")
+@click.option("--from", "time_start", default=None,
+              help="起始时间（ISO 格式）")
+@click.option("--to", "time_end", default=None,
+              help="截止时间（ISO 格式）")
+def replay_export(output, fmt, session_ids, batch, batch_name, operator,
+                  result, time_start, time_end):
+    sid_list = list(session_ids) if session_ids else None
+    try:
+        out_path = replay.export_replay_package(
+            output_path=output,
+            fmt=fmt,
+            session_ids=sid_list,
+            batch_id=batch,
+            batch_name=batch_name,
+            operator=operator,
+            result=result,
+            time_start=time_start,
+            time_end=time_end,
+        )
+    except (FileExistsError, FileNotFoundError, PermissionError,
+            IsADirectoryError, NotADirectoryError, ValueError) as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.REPLAY_OK_EXPORTED}: {out_path}")
+
+
+@replay_cmd.command("import", help=rules.REPLAY_IMPORT_HELP)
+@click.option("--input", "input_file", required=True, type=click.Path(),
+              help="证据包文件路径")
+@click.option("--force", is_flag=True, default=False,
+              help="版本不兼容或重复批次时强制导入")
+def replay_import(input_file, force):
+    try:
+        result = replay.import_replay_package(
+            package_path=input_file,
+            force=force,
+        )
+    except (FileNotFoundError, PermissionError, ValueError) as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.REPLAY_OK_IMPORTED)
+    click.echo(f"  导入会话数: {result['imported_session_count']}")
+    click.echo(f"  导入步骤数: {result['imported_step_count']}")
+    if result["skipped_session_count"]:
+        click.echo(f"  跳过会话数: {result['skipped_session_count']}（已存在且未使用 --force）")
+    if result.get("warnings"):
+        click.echo()
+        click.echo("⚠  警告:")
+        for w in result["warnings"]:
+            click.echo(f"  - {w}")
+
+
+@replay_cmd.command("undo", help=rules.REPLAY_UNDO_HELP)
+@click.argument("session_id", type=int)
+@click.option("--note", default=None, help="撤销备注")
+def replay_undo(session_id, note):
+    try:
+        session = replay.undo_replay_session(
+            session_id=session_id,
+            note=note,
+        )
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.REPLAY_OK_UNDONE)
+    click.echo(f"  会话 ID: {session['id']}")
+    click.echo(f"  名称: {session['name']}")
+    click.echo(f"  撤销时间: {session['undo_time']}")
+    if session.get("undo_note"):
+        click.echo(f"  撤销备注: {session['undo_note']}")
+
+
+@replay_cmd.command("config", help=rules.REPLAY_CONFIG_HELP)
+@click.option("--detail/--no-detail", default=None,
+              help="是否开启明细采集")
+@click.option("--masked-fields", default=None,
+              help="脱敏字段列表，逗号分隔")
+@click.option("--retention-days", type=int, default=None,
+              help="回放记录保留天数（0 表示永久保留）")
+def replay_config_cmd(detail, masked_fields, retention_days):
+    if detail is None and masked_fields is None and retention_days is None:
+        config = replay.get_replay_config()
+        click.echo(f"{rules.REPLAY_CONFIG_DETAIL_LABEL}: {'是' if config['detail_enabled'] else '否'}")
+        click.echo(f"{rules.REPLAY_CONFIG_MASKED_LABEL}: {', '.join(config['masked_fields']) if config['masked_fields'] else '无'}")
+        click.echo(f"{rules.REPLAY_CONFIG_RETENTION_LABEL}: {config['retention_days']}")
+        return
+
+    masked_list = None
+    if masked_fields is not None:
+        masked_list = [f.strip() for f in masked_fields.split(",") if f.strip()]
+
+    try:
+        config = replay.set_replay_config(
+            detail_enabled=detail,
+            masked_fields=masked_list,
+            retention_days=retention_days,
+        )
+    except ValueError as e:
+        click.echo(f"错误: {e}", err=True)
+        raise SystemExit(1)
+
+    click.echo(rules.REPLAY_CONFIG_SAVED)
+    click.echo(f"  {rules.REPLAY_CONFIG_DETAIL_LABEL}: {'是' if config['detail_enabled'] else '否'}")
+    click.echo(f"  {rules.REPLAY_CONFIG_MASKED_LABEL}: {', '.join(config['masked_fields']) if config['masked_fields'] else '无'}")
+    click.echo(f"  {rules.REPLAY_CONFIG_RETENTION_LABEL}: {config['retention_days']}")
+
+
+@replay_cmd.command("verify", help=rules.REPLAY_VERIFY_HELP)
+@click.option("--input", "input_file", required=True, type=click.Path(),
+              help="证据包文件路径")
+def replay_verify(input_file):
+    result = replay.verify_replay_package(input_file)
+
+    if result["valid"]:
+        click.echo(rules.REPLAY_OK_VERIFIED)
+        if result.get("manifest"):
+            m = result["manifest"]
+            click.echo(f"  Schema 版本: {m.get('schema_version', 'N/A')}")
+            click.echo(f"  工具版本: {m.get('tool_version', 'N/A')}")
+            if m.get("created_at"):
+                click.echo(f"  创建时间: {m['created_at']}")
+            if m.get("session_count") is not None:
+                click.echo(f"  会话数: {m['session_count']}")
+            if m.get("step_count") is not None:
+                click.echo(f"  步骤数: {m['step_count']}")
+        if result.get("warnings"):
+            click.echo()
+            click.echo("⚠  警告:")
+            for w in result["warnings"]:
+                click.echo(f"  - {w}")
+    else:
+        click.echo("证据包校验失败:", err=True)
+        for e in result["errors"]:
+            click.echo(f"  ✗ {e}", err=True)
+        raise SystemExit(1)
 
 
 # ======================================================================
