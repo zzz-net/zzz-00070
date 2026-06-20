@@ -1186,3 +1186,527 @@ def _verify_extracted_files(tmp: Path, errors: List[str], warnings: List[str]) -
         "warnings": warnings,
         "manifest": manifest if not errors else None,
     }
+
+
+# ============================================================================
+# 操作录制管理器（OperationRecorder）
+# ============================================================================
+#
+# 设计思路：
+#   1. 用户通过 `drill begin` 开始一次演练，自动创建回放会话
+#   2. 后续的 import/match/review/review-undo/export/revoke 等命令
+#      被 @record_operation 装饰器装饰，自动将步骤追加到当前活动会话
+#   3. 每一步自动记录：输入摘要、配置快照、批次号、结果、异常、操作者
+#   4. 通过 `drill end` 收口（success/failure），或 `drill undo` 撤销
+#   5. 命令异常时自动记录 error_type 和 error_traceback
+#
+# ============================================================================
+
+
+class OperationRecorder:
+    """
+    操作录制管理器（单例模式）。
+
+    自动追踪用户的操作序列，将每个 CLI 命令的执行过程
+    挂到同一条回放轨迹中，形成完整的可重放证据链。
+    """
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._active_session_id = None
+            cls._instance._active_batch_id = None
+            cls._instance._operator = "cli_user"
+        return cls._instance
+
+    def reset(self):
+        """重置录制管理器（主要用于测试）。"""
+        self._active_session_id = None
+        self._active_batch_id = None
+        self._operator = "cli_user"
+
+    # ------------------------------------------------------------------
+    # 演练生命周期管理
+    # ------------------------------------------------------------------
+
+    def begin_drill(
+        self,
+        name: str,
+        description: Optional[str] = None,
+        operator: str = "cli_user",
+        batch_id: Optional[int] = None,
+        batch_name: Optional[str] = None,
+        input_summary: Optional[Dict] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        开始一次演练。
+
+        创建一个新的回放会话，并将其设为当前活动会话。
+        后续所有被 @record_operation 装饰的命令都会自动
+        追加步骤到这个会话中。
+
+        Args:
+            name: 演练名称
+            description: 演练描述
+            operator: 操作者
+            batch_id: 关联的批次 ID
+            batch_name: 关联的批次名称
+            input_summary: 输入摘要
+            db_path: 数据库路径
+
+        Returns:
+            新创建的回放会话字典
+        """
+        init_replay_db(db_path)
+
+        if self._active_session_id is not None:
+            raise RuntimeError(
+                f"已有活动的演练（会话 ID: {self._active_session_id}），"
+                f"请先调用 end_drill() 或 undo_drill() 结束当前演练"
+            )
+
+        session = start_replay_session(
+            name=name,
+            description=description,
+            operator=operator,
+            batch_id=batch_id,
+            batch_name=batch_name,
+            input_summary=input_summary,
+            db_path=db_path,
+        )
+
+        self._active_session_id = session["id"]
+        self._active_batch_id = batch_id
+        self._operator = operator
+
+        add_replay_step(
+            session_id=session["id"],
+            action="drill_begin",
+            description="演练开始",
+            result="success",
+            detail={
+                "session_key": session["session_key"],
+                "operator": operator,
+            },
+            db_path=db_path,
+        )
+
+        return session
+
+    def end_drill(
+        self,
+        result: str = "success",
+        error_message: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        结束当前演练，收口成指定结果。
+
+        Args:
+            result: 结果（success/failure/error）
+            error_message: 错误信息
+            db_path: 数据库路径
+
+        Returns:
+            更新后的回放会话字典
+        """
+        if self._active_session_id is None:
+            raise RuntimeError("当前没有活动的演练，请先调用 begin_drill()")
+
+        session_id = self._active_session_id
+
+        add_replay_step(
+            session_id=session_id,
+            action="drill_end",
+            description="演练结束",
+            result=result,
+            detail={"final_result": result},
+            error_message=error_message,
+            db_path=db_path,
+        )
+
+        session = finish_replay_session(
+            session_id=session_id,
+            result=result,
+            error_message=error_message,
+            db_path=db_path,
+        )
+
+        self._active_session_id = None
+        self._active_batch_id = None
+
+        return session
+
+    def undo_drill(
+        self,
+        note: Optional[str] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        撤销当前演练，标记为 undone。
+
+        Args:
+            note: 撤销备注
+            db_path: 数据库路径
+
+        Returns:
+            更新后的回放会话字典
+        """
+        if self._active_session_id is None:
+            raise RuntimeError("当前没有活动的演练，请先调用 begin_drill()")
+
+        session_id = self._active_session_id
+
+        add_replay_step(
+            session_id=session_id,
+            action="drill_undo",
+            description="演练撤销",
+            result="success",
+            detail={"undo_note": note},
+            db_path=db_path,
+        )
+
+        session = undo_replay_session(
+            session_id=session_id,
+            note=note,
+            db_path=db_path,
+        )
+
+        self._active_session_id = None
+        self._active_batch_id = None
+
+        return session
+
+    # ------------------------------------------------------------------
+    # 活动会话查询
+    # ------------------------------------------------------------------
+
+    def get_active_session_id(self) -> Optional[int]:
+        """获取当前活动的演练会话 ID。"""
+        return self._active_session_id
+
+    def get_active_session(
+        self,
+        db_path: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """获取当前活动的演练会话详情。"""
+        if self._active_session_id is None:
+            return None
+        return get_replay_session(self._active_session_id, db_path=db_path)
+
+    def is_recording(self) -> bool:
+        """是否正在录制中。"""
+        return self._active_session_id is not None
+
+    def set_active_batch_id(self, batch_id: Optional[int]) -> None:
+        """设置当前活动的批次 ID（在 import 后自动关联）。"""
+        self._active_batch_id = batch_id
+
+    def get_active_batch_id(self) -> Optional[int]:
+        """获取当前活动的批次 ID。"""
+        return self._active_batch_id
+
+    # ------------------------------------------------------------------
+    # 操作步骤录制
+    # ------------------------------------------------------------------
+
+    def record_step(
+        self,
+        action: str,
+        description: Optional[str] = None,
+        input_args: Optional[Dict] = None,
+        result: str = "success",
+        detail: Optional[Dict] = None,
+        error_message: Optional[str] = None,
+        exception: Optional[BaseException] = None,
+        batch_id: Optional[int] = None,
+        db_path: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        录制一个操作步骤到当前活动会话。
+
+        如果没有活动会话，静默返回 None（不影响正常命令执行）。
+
+        Args:
+            action: 动作名称（如 import, match, review 等）
+            description: 步骤描述
+            input_args: 输入参数（会自动脱敏）
+            result: 步骤结果
+            detail: 详情字典
+            error_message: 错误信息
+            exception: 异常对象
+            batch_id: 批次 ID（优先使用，否则使用活动批次 ID）
+            db_path: 数据库路径
+
+        Returns:
+            步骤 ID，如果没有活动会话则返回 None
+        """
+        if self._active_session_id is None:
+            return None
+
+        config = get_replay_config(db_path)
+        effective_batch_id = batch_id or self._active_batch_id
+
+        detail_dict = dict(detail) if detail else {}
+
+        if input_args and config["detail_enabled"]:
+            detail_dict["input_args"] = _mask_dict(
+                input_args, config["masked_fields"]
+            )
+
+        if effective_batch_id is not None:
+            detail_dict["batch_id"] = effective_batch_id
+
+        detail_dict["operator"] = self._operator
+
+        step_id = add_replay_step(
+            session_id=self._active_session_id,
+            action=action,
+            description=description,
+            result=result,
+            detail=detail_dict,
+            error_message=error_message,
+            exception=exception,
+            db_path=db_path,
+        )
+
+        return step_id
+
+
+# 全局单例实例
+_recorder = OperationRecorder()
+
+
+# ---------------------------------------------------------------------------
+# 便捷函数：获取全局录制器
+# ---------------------------------------------------------------------------
+
+def get_recorder() -> OperationRecorder:
+    """获取全局操作录制器单例。"""
+    return _recorder
+
+
+# ---------------------------------------------------------------------------
+# 装饰器：@record_operation
+# ---------------------------------------------------------------------------
+
+def record_operation(
+    action: Optional[str] = None,
+    description: Optional[str] = None,
+    auto_detect_batch: bool = True,
+):
+    """
+    装饰器：自动录制 CLI 命令的执行过程。
+
+    将被装饰的函数调用自动记录为当前活动演练的一个步骤。
+    自动捕获：
+    - 输入参数（脱敏后）
+    - 执行结果
+    - 异常（类型、消息、堆栈）
+    - 批次 ID（从 kwargs 的 --batch 参数获取）
+
+    Args:
+        action: 动作名称（默认使用函数名）
+        description: 步骤描述
+        auto_detect_batch: 是否自动从 kwargs 中检测 --batch 参数
+
+    Usage:
+        @cli.command()
+        @click.option("--batch", type=int)
+        @record_operation(action="match", description="执行匹配")
+        def match_cmd(batch):
+            ...
+    """
+
+    def decorator(func):
+        action_name = action or func.__name__
+        step_description = description or f"执行命令: {action_name}"
+
+        import functools
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            recorder = get_recorder()
+
+            if not recorder.is_recording():
+                return func(*args, **kwargs)
+
+            input_args = _extract_input_args(func, args, kwargs)
+            batch_id = kwargs.get("batch") if auto_detect_batch else None
+
+            try:
+                result = func(*args, **kwargs)
+
+                recorder.record_step(
+                    action=action_name,
+                    description=step_description,
+                    input_args=input_args,
+                    result="success",
+                    batch_id=batch_id,
+                )
+
+                return result
+
+            except SystemExit as e:
+                if e.code == 0 or e.code is None:
+                    recorder.record_step(
+                        action=action_name,
+                        description=step_description,
+                        input_args=input_args,
+                        result="success",
+                        batch_id=batch_id,
+                    )
+                else:
+                    recorder.record_step(
+                        action=action_name,
+                        description=step_description,
+                        input_args=input_args,
+                        result="failure",
+                        error_message=f"命令退出码: {e.code}",
+                        batch_id=batch_id,
+                    )
+                raise
+
+            except Exception as e:
+                recorder.record_step(
+                    action=action_name,
+                    description=step_description,
+                    input_args=input_args,
+                    result="error",
+                    error_message=str(e),
+                    exception=e,
+                    batch_id=batch_id,
+                )
+                raise
+
+        return wrapper
+
+    return decorator
+
+
+def _extract_input_args(func, args, kwargs) -> Dict[str, Any]:
+    """
+    从函数调用中提取输入参数，转换为字典。
+
+    处理 click 命令的参数，排除不可序列化的对象。
+    """
+    import inspect
+
+    try:
+        sig = inspect.signature(func)
+        params = list(sig.parameters.keys())
+
+        result = {}
+
+        for i, arg in enumerate(args):
+            if i < len(params):
+                key = params[i]
+                result[key] = _make_serializable(arg)
+
+        for key, value in kwargs.items():
+            result[key] = _make_serializable(value)
+
+        return result
+    except Exception:
+        return {}
+
+
+def _make_serializable(value: Any) -> Any:
+    """将值转换为 JSON 可序列化的形式。"""
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, list):
+        return [_make_serializable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _make_serializable(v) for k, v in value.items()}
+    if isinstance(value, Path):
+        return str(value)
+    if hasattr(value, "__class__") and hasattr(value, "__name__"):
+        return f"<{value.__class__.__name__}>"
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# drill 模块的便捷 API（供 CLI 直接调用）
+# ---------------------------------------------------------------------------
+
+def begin_drill(
+    name: str,
+    description: Optional[str] = None,
+    operator: str = "cli_user",
+    batch_id: Optional[int] = None,
+    batch_name: Optional[str] = None,
+    input_summary: Optional[Dict] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """开始一次演练。"""
+    return get_recorder().begin_drill(
+        name=name,
+        description=description,
+        operator=operator,
+        batch_id=batch_id,
+        batch_name=batch_name,
+        input_summary=input_summary,
+        db_path=db_path,
+    )
+
+
+def end_drill(
+    result: str = "success",
+    error_message: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """结束当前演练。"""
+    return get_recorder().end_drill(
+        result=result,
+        error_message=error_message,
+        db_path=db_path,
+    )
+
+
+def undo_drill(
+    note: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """撤销当前演练。"""
+    return get_recorder().undo_drill(
+        note=note,
+        db_path=db_path,
+    )
+
+
+def get_active_drill(db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """获取当前活动的演练会话。"""
+    return get_recorder().get_active_session(db_path=db_path)
+
+
+def is_recording() -> bool:
+    """是否正在录制演练。"""
+    return get_recorder().is_recording()
+
+
+def set_active_batch_for_drill(batch_id: Optional[int]) -> None:
+    """为当前演练设置活动批次 ID，并更新会话表中的 batch_id。"""
+    recorder = get_recorder()
+    recorder.set_active_batch_id(batch_id)
+
+    if batch_id is not None and recorder.is_recording():
+        session_id = recorder.get_active_session_id()
+        if session_id is not None:
+            try:
+                from . import db
+                conn = db.connect()
+                try:
+                    with conn:
+                        conn.execute(
+                            "UPDATE replay_sessions SET batch_id = ? WHERE id = ?",
+                            (batch_id, session_id),
+                        )
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+

@@ -1,5 +1,6 @@
 import sys
 import os
+import json
 import click
 
 if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
@@ -8,6 +9,7 @@ if sys.stderr.encoding and sys.stderr.encoding.lower() != "utf-8":
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 from . import db, validators, matcher, export, rules, snapshot, pack, plan, audit, replay
+from .replay import record_operation, set_active_batch_for_drill
 from .models import BatchStatus, MatchStatus, Match
 
 
@@ -36,6 +38,7 @@ def init():
               help="批次名称（默认自动生成）")
 @click.option("--dry-run", "--plan", "dry_run", is_flag=True, default=False,
               help=rules.PLAN_DRY_RUN_OPTION_HELP)
+@record_operation(action="import", description="导入发票和付款数据")
 def import_data(invoices, payments, name, dry_run):
     if dry_run:
         _run_import_dry_run(invoices, payments, name)
@@ -121,6 +124,8 @@ def import_data(invoices, payments, name, dry_run):
             "original_name": plan_result.original_name if plan_result.was_renamed else None,
         },
     )
+
+    set_active_batch_for_drill(batch_id)
 
 
 def _run_import_dry_run(invoices: str, payments: str, name: str):
@@ -225,6 +230,7 @@ def config(tolerance, require_vendor_match):
 
 @cli.command()
 @click.option("--batch", required=True, type=int, help="批次 ID")
+@record_operation(action="match", description="执行发票与付款匹配")
 def match(batch):
     """对指定批次执行匹配（按当前规则生成匹配建议）
 
@@ -342,6 +348,7 @@ def match(batch):
 @click.option("--action", type=click.Choice(["confirm", "reject"]), default=None,
               help="裁决动作: confirm 或 reject（非交互模式）")
 @click.option("--note", default=None, help="复核备注")
+@record_operation(action="review", description="复核匹配结果")
 def review(batch, match_id, action, note):
     """复核匹配结果（交互或指定单条）
 
@@ -375,6 +382,7 @@ def review(batch, match_id, action, note):
 @cli.command("review-undo", help=rules.REVIEW_UNDO_RULES_HELP)
 @click.option("--batch", required=True, type=int, help="批次 ID")
 @click.option("--match-id", required=True, type=int, help="匹配记录 ID")
+@record_operation(action="review-undo", description="撤销单条匹配裁决")
 def review_undo(batch, match_id):
     b = db.get_batch(batch)
     if b is None:
@@ -648,6 +656,7 @@ def _print_match(m):
 
 @cli.command()
 @click.option("--batch", required=True, type=int, help="批次 ID")
+@record_operation(action="revoke", description="撤销整个批次")
 def revoke(batch):
     """撤销批次（标记为 revoked，不影响其他批次数据）
 
@@ -708,6 +717,7 @@ def revoke(batch):
 @click.option("--batch", required=True, type=int, help="批次 ID")
 @click.option("--output", required=True, type=click.Path(),
               help=rules.EXPORT_OUTPUT_HELP)
+@record_operation(action="export", description="导出差异结果文件")
 def export_cmd(batch, output):
     b = db.get_batch(batch)
     if b is None:
@@ -1795,6 +1805,122 @@ def replay_verify(input_file):
         raise SystemExit(1)
 
 
+@cli.group("drill", help=rules.DRILL_RULES_HELP)
+def drill_cmd():
+    """操作录制与证据回灌命令组。"""
+    pass
+
+
+@drill_cmd.command("begin", help=rules.DRILL_BEGIN_HELP)
+@click.option("--name", required=True, help="演练名称")
+@click.option("--description", default=None, help="演练描述")
+@click.option("--operator", default="cli_user", help="操作者（默认 cli_user）")
+@click.option("--batch", type=int, default=None, help="关联的批次 ID")
+@click.option("--input", "input_json", default=None,
+              help="输入摘要（JSON 字符串）")
+def drill_begin(name, description, operator, batch, input_json):
+    """开始一次操作演练。"""
+    try:
+        input_summary = json.loads(input_json) if input_json else None
+    except json.JSONDecodeError as e:
+        click.echo(f"输入摘要格式错误: {e}", err=True)
+        raise SystemExit(1)
+
+    batch_name = None
+    if batch is not None:
+        b = db.get_batch(batch)
+        if b:
+            batch_name = b["name"]
+
+    session = replay.begin_drill(
+        name=name,
+        description=description,
+        operator=operator,
+        batch_id=batch,
+        batch_name=batch_name,
+        input_summary=input_summary,
+    )
+
+    click.echo(f"{rules.DRILL_OK_BEGUN}，会话 ID: {session['id']}")
+    click.echo(f"  会话 Key: {session['session_key']}")
+    click.echo(f"  名称: {session['name']}")
+    if session.get("description"):
+        click.echo(f"  描述: {session['description']}")
+    click.echo(f"  操作者: {session['operator']}")
+    if session.get("batch_id"):
+        click.echo(f"  关联批次: {session['batch_id']} ({session.get('batch_name', 'N/A')})")
+    click.echo()
+    click.echo("后续执行的 import/match/review/review-undo/export/revoke 命令")
+    click.echo("将自动记录为演练步骤，直到执行 drill end 或 drill undo。")
+
+
+@drill_cmd.command("end", help=rules.DRILL_END_HELP)
+@click.option("--result", type=click.Choice(["success", "failure", "error"]),
+              default="success", help="演练结果（默认 success）")
+@click.option("--error-message", default=None, help="错误信息")
+def drill_end(result, error_message):
+    """结束当前演练。"""
+    if not replay.is_recording():
+        click.echo(rules.DRILL_ERR_NO_ACTIVE, err=True)
+        raise SystemExit(1)
+
+    session = replay.end_drill(
+        result=result,
+        error_message=error_message,
+    )
+
+    click.echo(f"{rules.DRILL_OK_ENDED}，会话 ID: {session['id']}")
+    click.echo(f"  结果: {session['result']}")
+    if session.get("error_message"):
+        click.echo(f"  错误: {session['error_message']}")
+    if session.get("end_time"):
+        click.echo(f"  结束时间: {session['end_time']}")
+
+
+@drill_cmd.command("undo", help=rules.DRILL_UNDO_HELP)
+@click.option("--note", default=None, help="撤销备注")
+def drill_undo(note):
+    """撤销当前演练。"""
+    if not replay.is_recording():
+        click.echo(rules.DRILL_ERR_NO_ACTIVE, err=True)
+        raise SystemExit(1)
+
+    session = replay.undo_drill(note=note)
+
+    click.echo(f"{rules.DRILL_OK_UNDONE}，会话 ID: {session['id']}")
+    if session.get("undo_note"):
+        click.echo(f"  备注: {session['undo_note']}")
+    if session.get("undo_time"):
+        click.echo(f"  撤销时间: {session['undo_time']}")
+
+
+@drill_cmd.command("status", help=rules.DRILL_STATUS_HELP)
+def drill_status():
+    """查看当前演练状态。"""
+    session = replay.get_active_drill()
+
+    if session is None:
+        click.echo(rules.DRILL_STATUS_IDLE)
+        return
+
+    click.echo(f"{rules.DRILL_STATUS_ACTIVE}")
+    click.echo(f"  会话 ID: {session['id']}")
+    click.echo(f"  名称: {session['name']}")
+    click.echo(f"  开始时间: {session['start_time']}")
+    click.echo(f"  操作者: {session['operator']}")
+    if session.get("batch_id"):
+        click.echo(f"  当前批次: {session['batch_id']} ({session.get('batch_name', 'N/A')})")
+
+    steps = replay.get_replay_steps(session["id"])
+    click.echo(f"  已执行步骤: {len(steps)}")
+    if steps:
+        click.echo()
+        click.echo("  步骤列表:")
+        for st in steps:
+            status_icon = "✓" if st["result"] == "success" else "✗"
+            click.echo(f"    {status_icon} [{st['step_index']}] {st['action']} - {st['description']}")
+
+
 # ======================================================================
 # 统一为命令函数设置 __doc__ —— 让 --help 显示 rules 模块的共享文案。
 # 必须放在所有命令定义之后（否则函数还不存在）。
@@ -1809,3 +1935,15 @@ pack_cmd.__doc__ = rules.PACK_CREATE_HELP
 unpack_cmd.__doc__ = rules.PACK_UNPACK_HELP
 verify_cmd.__doc__ = rules.PACK_VERIFY_HELP
 inspect_cmd.__doc__ = rules.PACK_INSPECT_HELP
+replay_start.__doc__ = rules.REPLAY_START_HELP
+replay_list.__doc__ = rules.REPLAY_LIST_HELP
+replay_show.__doc__ = rules.REPLAY_SHOW_HELP
+replay_export.__doc__ = rules.REPLAY_EXPORT_HELP
+replay_import.__doc__ = rules.REPLAY_IMPORT_HELP
+replay_undo.__doc__ = rules.REPLAY_UNDO_HELP
+replay_config_cmd.__doc__ = rules.REPLAY_CONFIG_HELP
+replay_verify.__doc__ = rules.REPLAY_VERIFY_HELP
+drill_begin.__doc__ = rules.DRILL_BEGIN_HELP
+drill_end.__doc__ = rules.DRILL_END_HELP
+drill_undo.__doc__ = rules.DRILL_UNDO_HELP
+drill_status.__doc__ = rules.DRILL_STATUS_HELP

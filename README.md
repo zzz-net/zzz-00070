@@ -400,6 +400,325 @@ inv-recon inspect --input FILE
 
 所有数据保存在当前目录的 `inv_recon.db`（SQLite）。可通过环境变量 `INV_RECON_DB` 指定其他路径。换终端重新运行后，规则版本、复核备注、撤销结果和导出的差异行保持一致。
 
+## 任务回放与证据包
+
+将一次复杂操作的输入、配置、关键步骤、冲突处理、撤销结果和异常日志串成可重放记录，持久化到 SQLite，跨重启可查。
+
+### 命令一览
+
+| 命令 | 作用 |
+|------|------|
+| `replay start` | 开始一个回放会话 |
+| `replay list` | 列出回放会话（支持筛选） |
+| `replay show <id>` | 查看会话详情和步骤 |
+| `replay export` | 导出证据包（JSON/CSV/ZIP） |
+| `replay import` | 导入证据包 |
+| `replay undo <id>` | 撤销回放会话 |
+| `replay config` | 查看/修改回放配置 |
+| `replay verify` | 校验证据包完整性 |
+
+### 开始回放会话
+
+```bash
+inv-recon replay start --name "批次导入" --description "导入2024年1月发票" \
+  --operator alice --batch 1 --input '{"file": "invoices.csv"}'
+```
+
+开始后会返回会话 ID，后续可通过 API 添加步骤。
+
+### 列出回放会话
+
+```bash
+# 全部列出
+inv-recon replay list
+
+# 按操作者筛选
+inv-recon replay list --operator alice
+
+# 按批次筛选
+inv-recon replay list --batch 1
+
+# 按结果筛选（running/success/failure/error/undone）
+inv-recon replay list --result success
+
+# 按步骤动作筛选（包含该动作的会话）
+inv-recon replay list --action import
+
+# 按时间范围
+inv-recon replay list --from 2024-01-01 --to 2024-12-31
+
+# 限制条数
+inv-recon replay list --limit 10
+```
+
+### 查看回放详情
+
+```bash
+inv-recon replay show 1
+```
+
+显示会话信息、配置快照、输入摘要和所有步骤（含详情、错误信息）。
+
+### 导出证据包
+
+支持三种格式：JSON、CSV、ZIP（`.reppkg`）。
+
+```bash
+# JSON 格式（包含所有会话和步骤）
+inv-recon replay export --output replay.json --format json
+
+# CSV 格式（会话和步骤混合，用 type 列区分）
+inv-recon replay export --output replay.csv --format csv
+
+# ZIP 压缩包（包含 manifest、sessions、steps、校验和）
+inv-recon replay export --output replay.reppkg --format zip
+
+# 带筛选条件导出
+inv-recon replay export --output filtered.json --format json --operator alice --result success
+```
+
+**导出保证**：
+- 目标文件已存在时报错不覆盖，保护已有数据
+- 目标目录不可写时报错
+- 原子写入：失败不产生半截文件
+
+### 导入证据包
+
+```bash
+# 普通导入
+inv-recon replay import --input replay.json
+
+# 强制导入（版本不兼容或重复会话时覆盖）
+inv-recon replay import --input replay.json --force
+```
+
+**导入规则**：
+- 导入前校验包完整性，不完整则拒绝导入
+- 版本不兼容时报错，`--force` 可强制导入
+- 重复会话（session_key 相同）默认跳过，`--force` 会覆盖
+- 不覆盖已有数据，始终作为新记录导入
+- 只读目录/不可写目录会报错
+
+### 撤销回放会话
+
+```bash
+inv-recon replay undo 1 --note "操作有误，已撤销"
+```
+
+撤销后：
+- 会话标记为 `undone` 状态
+- 保留所有步骤记录，仍可回看
+- 不能再添加新步骤
+
+### 回放配置
+
+```bash
+# 查看当前配置
+inv-recon replay config
+
+# 开启/关闭明细采集
+inv-recon replay config --detail
+inv-recon replay config --no-detail
+
+# 设置脱敏字段（逗号分隔）
+inv-recon replay config --masked-fields password,secret_key,token
+
+# 设置保留天数（0 表示永久保留）
+inv-recon replay config --retention-days 90
+```
+
+**非法配置会被拦住并写清原因**：
+- `retention_days` 不能为负数
+- `detail_enabled` 必须是布尔值
+- `masked_fields` 不能包含空字符串
+
+### 校验证据包
+
+```bash
+inv-recon replay verify --input replay.reppkg
+```
+
+检查项：
+- 文件存在且格式正确
+- 必需文件齐全（manifest/sessions/steps/checksums）
+- 校验和匹配
+- schema 版本兼容性
+
+## 操作录制与证据回灌
+
+通过 `drill` 命令组实现操作自动录制。开始一次演练后，后续的导入、匹配、复核、撤销、导出等命令都会**自动挂到同一条回放轨迹中**，无需手动创建会话和补步骤。
+
+每一步自动记录：输入摘要、配置快照、批次号、结果、异常、操作者。
+
+### 命令一览
+
+| 命令 | 作用 |
+|------|------|
+| `drill begin` | 开始一次操作演练 |
+| `drill end` | 结束演练，收口成 success/failure/error |
+| `drill undo` | 撤销当前演练，标记为 undone |
+| `drill status` | 查看当前演练状态 |
+
+### 完整使用示例
+
+```bash
+# 1. 开始演练
+inv-recon drill begin --name "2024年1月对账" \
+  --description "核对2024年1月供应商发票" \
+  --operator alice
+
+# 2. 后续命令自动录制（无需手动操作）
+inv-recon import --invoices invoices_202401.csv --payments payments_202401.csv
+inv-recon match --batch 1
+inv-recon review --batch 1 --match-id 1 --action confirm
+inv-recon review-undo --batch 1 --match-id 1
+inv-recon export --batch 1 --output result.csv
+
+# 3. 结束演练（自动收口）
+inv-recon drill end --result success
+
+# 或撤销演练
+inv-recon drill undo --note "操作有误，重新核对"
+```
+
+### 开始演练
+
+```bash
+# 最简用法
+inv-recon drill begin --name "对账演练"
+
+# 带操作者和描述
+inv-recon drill begin --name "1月对账" --operator alice \
+  --description "处理1月供应商发票与付款勾稽"
+
+# 指定关联批次
+inv-recon drill begin --name "批次1复核" --batch 1
+
+# 带输入摘要
+inv-recon drill begin --name "导入演练" \
+  --input '{"source": "财务系统", "period": "2024-01"}'
+```
+
+开始后会返回会话 ID，并提示后续命令将自动录制。
+
+### 查看演练状态
+
+```bash
+inv-recon drill status
+```
+
+输出示例：
+```
+● 演练进行中
+  会话 ID: 1
+  名称: 2024年1月对账
+  开始时间: 2024-01-15 10:30:00
+  操作者: alice
+  当前批次: 1 (2024-01-supplier)
+  已执行步骤: 5
+
+  步骤列表:
+    ✓ [1] drill_begin - 演练开始
+    ✓ [2] import - 导入发票和付款数据
+    ✓ [3] match - 执行发票与付款匹配
+    ✓ [4] review - 复核匹配结果
+    ✓ [5] export - 导出差异结果文件
+```
+
+### 结束演练
+
+```bash
+# 成功结束
+inv-recon drill end --result success
+
+# 失败结束，带错误信息
+inv-recon drill end --result failure --error-message "匹配冲突未解决"
+
+# 错误结束
+inv-recon drill end --result error --error-message "程序异常"
+```
+
+### 撤销演练
+
+```bash
+# 撤销当前演练
+inv-recon drill undo
+
+# 带备注
+inv-recon drill undo --note "数据有误，需要重新导入"
+```
+
+撤销后：
+- 会话标记为 `undone` 状态
+- 所有步骤记录保留，可通过 `replay show` 回看
+- 不能再添加新步骤
+
+### 无活动演练时的行为
+
+- 命令正常执行，不影响正常使用
+- 不产生任何录制记录
+- `drill status` 显示"○ 无活动演练"
+
+### 查看演练记录
+
+演练录制的记录与普通回放会话共享同一套查询接口：
+
+```bash
+# 列出所有演练（支持筛选）
+inv-recon replay list --operator alice --result success
+
+# 查看演练详情（含所有步骤）
+inv-recon replay show 1
+
+# 导出演练证据包
+inv-recon replay export --output drill_202401.reppkg --format zip
+
+# 按批次筛选演练
+inv-recon replay list --batch 1
+
+# 按时间段筛选
+inv-recon replay list --from 2024-01-01 --to 2024-01-31
+```
+
+### 自动录制的命令列表
+
+以下命令在演练期间会自动录制：
+
+| 命令 | 动作名称 | 描述 |
+|------|----------|------|
+| `import` | `import` | 导入发票和付款数据 |
+| `match` | `match` | 执行发票与付款匹配 |
+| `review` | `review` | 复核匹配结果 |
+| `review-undo` | `review-undo` | 撤销单条匹配裁决 |
+| `export` | `export` | 导出差异结果文件 |
+| `revoke` | `revoke` | 撤销整个批次 |
+
+### 录制内容说明
+
+每一步自动记录：
+- **输入摘要**：命令参数（脱敏后）
+- **配置快照**：录制开始时的回放配置
+- **批次号**：操作关联的批次 ID
+- **结果**：success / failure / error
+- **异常信息**：异常类型、消息、堆栈
+- **操作者**：演练开始时指定的操作者
+- **时间戳**：操作执行时间
+
+### 配置对录制的影响
+
+回放配置同样适用于操作录制：
+
+```bash
+# 关闭明细采集，不记录 input_args
+inv-recon replay config --no-detail
+
+# 设置脱敏字段
+inv-recon replay config --masked-fields password,api_key,token
+
+# 设置保留天数
+inv-recon replay config --retention-days 180
+```
+
 ## 批次状态流转
 
 ```
