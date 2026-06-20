@@ -1854,6 +1854,29 @@ def drill_begin(name, description, operator, batch, input_json):
     click.echo("将自动记录为演练步骤，直到执行 drill end 或 drill undo。")
 
 
+@drill_cmd.command("resume", help=rules.DRILL_RESUME_HELP)
+@click.option("--session-id", type=int, default=None, help="要恢复的会话 ID（可选，不指定则自动恢复）")
+def drill_resume(session_id):
+    """恢复活动演练。"""
+    try:
+        session = replay.resume_drill(session_id=session_id)
+    except RuntimeError as e:
+        click.echo(str(e), err=True)
+        raise SystemExit(1)
+
+    click.echo(f"{rules.DRILL_OK_RESUMED}，会话 ID: {session['id']}")
+    click.echo(f"  会话 Key: {session['session_key']}")
+    click.echo(f"  名称: {session['name']}")
+    if session.get("description"):
+        click.echo(f"  描述: {session['description']}")
+    click.echo(f"  操作者: {session['operator']}")
+    if session.get("batch_id"):
+        click.echo(f"  关联批次: {session['batch_id']} ({session.get('batch_name', 'N/A')})")
+
+    steps = replay.get_replay_steps(session["id"])
+    click.echo(f"  已执行步骤: {len(steps)}")
+
+
 @drill_cmd.command("end", help=rules.DRILL_END_HELP)
 @click.option("--result", type=click.Choice(["success", "failure", "error"]),
               default="success", help="演练结果（默认 success）")

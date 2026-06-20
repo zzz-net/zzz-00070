@@ -156,6 +156,78 @@ def _ensure_replay_config_defaults(conn: sqlite3.Connection) -> None:
             "INSERT INTO replay_config (key, value) VALUES (?, ?)",
             ("retention_days", str(DEFAULT_RETENTION_DAYS)),
         )
+    if "active_session_id" not in existing:
+        conn.execute(
+            "INSERT INTO replay_config (key, value) VALUES (?, ?)",
+            ("active_session_id", ""),
+        )
+    if "active_batch_id" not in existing:
+        conn.execute(
+            "INSERT INTO replay_config (key, value) VALUES (?, ?)",
+            ("active_batch_id", ""),
+        )
+
+
+def _get_active_session_id(db_path: Optional[str] = None) -> Optional[int]:
+    init_replay_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM replay_config WHERE key = ?",
+            ("active_session_id",),
+        ).fetchone()
+        if row and row["value"]:
+            try:
+                return int(row["value"])
+            except (ValueError, TypeError):
+                return None
+        return None
+    finally:
+        conn.close()
+
+
+def _set_active_session_id(session_id: Optional[int], db_path: Optional[str] = None) -> None:
+    init_replay_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO replay_config (key, value) VALUES (?, ?)",
+                ("active_session_id", str(session_id) if session_id is not None else ""),
+            )
+    finally:
+        conn.close()
+
+
+def _get_active_batch_id(db_path: Optional[str] = None) -> Optional[int]:
+    init_replay_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT value FROM replay_config WHERE key = ?",
+            ("active_batch_id",),
+        ).fetchone()
+        if row and row["value"]:
+            try:
+                return int(row["value"])
+            except (ValueError, TypeError):
+                return None
+        return None
+    finally:
+        conn.close()
+
+
+def _set_active_batch_id(batch_id: Optional[int], db_path: Optional[str] = None) -> None:
+    init_replay_db(db_path)
+    conn = db.connect(db_path)
+    try:
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO replay_config (key, value) VALUES (?, ?)",
+                ("active_batch_id", str(batch_id) if batch_id is not None else ""),
+            )
+    finally:
+        conn.close()
 
 
 def get_replay_config(db_path: Optional[str] = None) -> Dict[str, Any]:
@@ -1209,6 +1281,8 @@ class OperationRecorder:
 
     自动追踪用户的操作序列，将每个 CLI 命令的执行过程
     挂到同一条回放轨迹中，形成完整的可重放证据链。
+
+    活动状态持久化到 SQLite，跨进程、跨重启可恢复。
     """
 
     _instance = None
@@ -1219,6 +1293,8 @@ class OperationRecorder:
             cls._instance._active_session_id = None
             cls._instance._active_batch_id = None
             cls._instance._operator = "cli_user"
+            cls._instance._loaded_from_db = False
+            cls._instance._db_path_cache = None
         return cls._instance
 
     def reset(self):
@@ -1226,6 +1302,50 @@ class OperationRecorder:
         self._active_session_id = None
         self._active_batch_id = None
         self._operator = "cli_user"
+        self._loaded_from_db = False
+        self._db_path_cache = None
+
+    def _resolve_db_path(self, db_path: Optional[str] = None) -> str:
+        """解析实际的数据库路径。"""
+        return db_path if db_path is not None else db.get_db_path()
+
+    def _ensure_loaded(self, db_path: Optional[str] = None) -> None:
+        """确保活动状态已从数据库加载（懒加载）。
+
+        总是从数据库加载最新状态，保证跨调用一致性。
+        如果数据库中没有活动会话，则使用内存状态作为 fallback。
+        """
+        effective_path = self._resolve_db_path(db_path)
+
+        if self._loaded_from_db and self._db_path_cache == effective_path:
+            return
+
+        session_id = _get_active_session_id(effective_path)
+        batch_id = _get_active_batch_id(effective_path)
+
+        if session_id is not None:
+            session = get_replay_session(session_id, db_path=effective_path)
+            if session and session["result"] == "running":
+                self._active_session_id = session_id
+                self._active_batch_id = batch_id
+                self._operator = session.get("operator", "cli_user")
+            else:
+                self._active_session_id = None
+                self._active_batch_id = None
+                self._operator = "cli_user"
+                _set_active_session_id(None, effective_path)
+                _set_active_batch_id(None, effective_path)
+
+        self._loaded_from_db = True
+        self._db_path_cache = effective_path
+
+    def _persist_active_state(self, db_path: Optional[str] = None) -> None:
+        """将活动状态持久化到数据库。"""
+        effective_path = self._resolve_db_path(db_path)
+        _set_active_session_id(self._active_session_id, effective_path)
+        _set_active_batch_id(self._active_batch_id, effective_path)
+        self._db_path_cache = effective_path
+        self._loaded_from_db = True
 
     # ------------------------------------------------------------------
     # 演练生命周期管理
@@ -1248,6 +1368,8 @@ class OperationRecorder:
         后续所有被 @record_operation 装饰的命令都会自动
         追加步骤到这个会话中。
 
+        活动状态持久化到 SQLite，跨进程可恢复。
+
         Args:
             name: 演练名称
             description: 演练描述
@@ -1261,6 +1383,7 @@ class OperationRecorder:
             新创建的回放会话字典
         """
         init_replay_db(db_path)
+        self._ensure_loaded(db_path)
 
         if self._active_session_id is not None:
             raise RuntimeError(
@@ -1281,6 +1404,7 @@ class OperationRecorder:
         self._active_session_id = session["id"]
         self._active_batch_id = batch_id
         self._operator = operator
+        self._persist_active_state(db_path)
 
         add_replay_step(
             session_id=session["id"],
@@ -1295,6 +1419,45 @@ class OperationRecorder:
         )
 
         return session
+
+    def resume_drill(
+        self,
+        session_id: Optional[int] = None,
+        db_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        恢复一个已有的演练会话为活动状态。
+
+        如果不指定 session_id，则尝试恢复数据库中记录的活动会话。
+        只有 running 状态的会话可以被恢复。
+
+        Args:
+            session_id: 要恢复的会话 ID（可选）
+            db_path: 数据库路径
+
+        Returns:
+            恢复后的回放会话字典
+        """
+        init_replay_db(db_path)
+
+        if session_id is not None:
+            session = get_replay_session(session_id, db_path=db_path)
+            if session is None:
+                raise ValueError(f"回放会话不存在: {session_id}")
+            if session["result"] != "running":
+                raise ValueError(
+                    f"仅 running 状态的会话可恢复，当前状态: {session['result']}"
+                )
+            self._active_session_id = session_id
+            self._active_batch_id = session.get("batch_id")
+            self._operator = session.get("operator", "cli_user")
+            self._persist_active_state(db_path)
+            return session
+        else:
+            self._ensure_loaded(db_path)
+            if self._active_session_id is None:
+                raise RuntimeError("没有可恢复的活动演练")
+            return get_replay_session(self._active_session_id, db_path=db_path)
 
     def end_drill(
         self,
@@ -1313,6 +1476,8 @@ class OperationRecorder:
         Returns:
             更新后的回放会话字典
         """
+        self._ensure_loaded(db_path)
+
         if self._active_session_id is None:
             raise RuntimeError("当前没有活动的演练，请先调用 begin_drill()")
 
@@ -1337,6 +1502,7 @@ class OperationRecorder:
 
         self._active_session_id = None
         self._active_batch_id = None
+        self._persist_active_state(db_path)
 
         return session
 
@@ -1355,6 +1521,8 @@ class OperationRecorder:
         Returns:
             更新后的回放会话字典
         """
+        self._ensure_loaded(db_path)
+
         if self._active_session_id is None:
             raise RuntimeError("当前没有活动的演练，请先调用 begin_drill()")
 
@@ -1377,6 +1545,7 @@ class OperationRecorder:
 
         self._active_session_id = None
         self._active_batch_id = None
+        self._persist_active_state(db_path)
 
         return session
 
@@ -1384,8 +1553,9 @@ class OperationRecorder:
     # 活动会话查询
     # ------------------------------------------------------------------
 
-    def get_active_session_id(self) -> Optional[int]:
+    def get_active_session_id(self, db_path: Optional[str] = None) -> Optional[int]:
         """获取当前活动的演练会话 ID。"""
+        self._ensure_loaded(db_path)
         return self._active_session_id
 
     def get_active_session(
@@ -1393,20 +1563,43 @@ class OperationRecorder:
         db_path: Optional[str] = None,
     ) -> Optional[Dict[str, Any]]:
         """获取当前活动的演练会话详情。"""
+        self._ensure_loaded(db_path)
         if self._active_session_id is None:
             return None
         return get_replay_session(self._active_session_id, db_path=db_path)
 
-    def is_recording(self) -> bool:
+    def is_recording(self, db_path: Optional[str] = None) -> bool:
         """是否正在录制中。"""
+        self._ensure_loaded(db_path)
         return self._active_session_id is not None
 
-    def set_active_batch_id(self, batch_id: Optional[int]) -> None:
-        """设置当前活动的批次 ID（在 import 后自动关联）。"""
+    def set_active_batch_id(self, batch_id: Optional[int], db_path: Optional[str] = None) -> None:
+        """设置当前活动的批次 ID（在 import 后自动关联）。
+
+        同时更新数据库中的活动批次 ID 和会话表中的 batch_id。
+        """
+        self._ensure_loaded(db_path)
         self._active_batch_id = batch_id
 
-    def get_active_batch_id(self) -> Optional[int]:
+        if self._active_session_id is not None and batch_id is not None:
+            try:
+                conn = db.connect(db_path)
+                try:
+                    with conn:
+                        conn.execute(
+                            "UPDATE replay_sessions SET batch_id = ? WHERE id = ?",
+                            (batch_id, self._active_session_id),
+                        )
+                finally:
+                    conn.close()
+            except Exception:
+                pass
+
+        self._persist_active_state(db_path)
+
+    def get_active_batch_id(self, db_path: Optional[str] = None) -> Optional[int]:
         """获取当前活动的批次 ID。"""
+        self._ensure_loaded(db_path)
         return self._active_batch_id
 
     # ------------------------------------------------------------------
@@ -1444,6 +1637,8 @@ class OperationRecorder:
         Returns:
             步骤 ID，如果没有活动会话则返回 None
         """
+        self._ensure_loaded(db_path)
+
         if self._active_session_id is None:
             return None
 
@@ -1654,6 +1849,20 @@ def begin_drill(
     )
 
 
+def resume_drill(
+    session_id: Optional[int] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """恢复一个演练为活动状态。
+
+    如果不指定 session_id，则尝试恢复数据库中记录的活动会话。
+    """
+    return get_recorder().resume_drill(
+        session_id=session_id,
+        db_path=db_path,
+    )
+
+
 def end_drill(
     result: str = "success",
     error_message: Optional[str] = None,
@@ -1683,30 +1892,13 @@ def get_active_drill(db_path: Optional[str] = None) -> Optional[Dict[str, Any]]:
     return get_recorder().get_active_session(db_path=db_path)
 
 
-def is_recording() -> bool:
+def is_recording(db_path: Optional[str] = None) -> bool:
     """是否正在录制演练。"""
-    return get_recorder().is_recording()
+    return get_recorder().is_recording(db_path=db_path)
 
 
-def set_active_batch_for_drill(batch_id: Optional[int]) -> None:
+def set_active_batch_for_drill(batch_id: Optional[int], db_path: Optional[str] = None) -> None:
     """为当前演练设置活动批次 ID，并更新会话表中的 batch_id。"""
     recorder = get_recorder()
-    recorder.set_active_batch_id(batch_id)
-
-    if batch_id is not None and recorder.is_recording():
-        session_id = recorder.get_active_session_id()
-        if session_id is not None:
-            try:
-                from . import db
-                conn = db.connect()
-                try:
-                    with conn:
-                        conn.execute(
-                            "UPDATE replay_sessions SET batch_id = ? WHERE id = ?",
-                            (batch_id, session_id),
-                        )
-                finally:
-                    conn.close()
-            except Exception:
-                pass
+    recorder.set_active_batch_id(batch_id, db_path=db_path)
 

@@ -745,14 +745,23 @@ DRILL_RULES_HELP = (
     "操作录制与证据回灌命令组。\n\n"
     "通过 begin 开始一次演练后，后续的导入、匹配、复核、撤销、导出等操作\n"
     "都会自动挂到同一条回放轨迹中，形成完整的可重放证据链。\n\n"
-    "子命令: begin / end / undo / status"
+    "活动状态持久化到 SQLite，跨进程、跨重启可恢复。\n\n"
+    "子命令: begin / resume / end / undo / status"
 )
 
 DRILL_BEGIN_HELP = (
     "开始一次操作演练。\n\n"
     "创建一个新的回放会话，后续的 import/match/review/review-undo/export/revoke\n"
     "等命令会自动记录为演练步骤。\n\n"
-    "每一步自动记录：输入摘要、配置快照、批次号、结果、异常、操作者。"
+    "每一步自动记录：输入摘要、配置快照、批次号、结果、异常、操作者。\n\n"
+    "活动状态持久化到 SQLite，进程重启后可通过 drill resume 恢复。"
+)
+
+DRILL_RESUME_HELP = (
+    "恢复活动演练。\n\n"
+    "不指定会话 ID 时，自动恢复数据库中记录的活动演练。\n"
+    "指定会话 ID 时，将指定的 running 状态会话设为活动状态。\n\n"
+    "仅 running 状态的会话可以被恢复。"
 )
 
 DRILL_END_HELP = (
@@ -771,11 +780,13 @@ DRILL_STATUS_HELP = (
 )
 
 DRILL_OK_BEGUN = "演练已开始"
+DRILL_OK_RESUMED = "演练已恢复"
 DRILL_OK_ENDED = "演练已结束"
 DRILL_OK_UNDONE = "演练已撤销"
 
 DRILL_ERR_NO_ACTIVE = "当前没有活动的演练，请先执行 drill begin"
 DRILL_ERR_ALREADY_ACTIVE = "已有活动的演练，请先结束或撤销当前演练"
+DRILL_ERR_NOT_RUNNING = "仅 running 状态的会话可以被恢复"
 
 DRILL_STATUS_ACTIVE = "● 演练进行中"
 DRILL_STATUS_IDLE = "○ 无活动演练"

@@ -581,6 +581,23 @@ inv-recon drill end --result success
 inv-recon drill undo --note "操作有误，重新核对"
 ```
 
+### 跨进程/跨重启使用示例
+
+演练活动状态持久化到 SQLite，即使进程退出或切换终端，也能恢复并继续：
+
+```bash
+# 终端 1：开始演练
+inv-recon drill begin --name "月末对账" --operator bob
+inv-recon import --invoices jan.csv --payments jan_pay.csv
+
+# ... 进程退出或关闭终端 ...
+
+# 终端 2：恢复演练，继续操作
+inv-recon drill resume
+inv-recon match --batch 1
+inv-recon drill end --result success
+```
+
 ### 开始演练
 
 ```bash
